@@ -1,0 +1,52 @@
+RoBan ACP 可运行分发包
+
+目标平台：Linux x86_64，Python 3.12。
+CUDA 批量仿真/训练需要支持 CUDA 12.8 的 NVIDIA 驱动；单机器人无窗口演示可以使用 CPU。
+这个包不附带虚拟环境。首次安装需要联网下载 Python 依赖；依赖版本已固定。
+
+1. 进入解压后的 Acp_supermimic_vibed 目录，按照 README_ENVIRONMENT.md 创建 .venv 并安装依赖。
+   环境配置 README 提供固定版本、mjlab 源码提交和安装命令。
+
+2. 运行随包的 22000 权重，执行两秒无窗口 planner-tracker 闭环：
+
+   ./run_roban_interactive.sh --headless --device cpu --seconds 2
+
+3. 有桌面显示环境时，启动交互界面：
+
+   ./run_roban_interactive.sh
+
+   Space 开始/暂停；WASD 移动目标；Tab 切换地形；G 将目标移到地形出口；R 重置。
+   该权重是 Stage 2 跟踪训练的产物，交互场景属于直接迁移测试，不代表能通过所有地形。
+
+4. 在 NVIDIA GPU 上，对随包数据执行 planner-tracker 闭环测评：
+
+   ./run_roban.sh evaluate \
+     --ckpt logs/acp_roban_stage2_v3_reset_noise_20261111_202310/ckpt_022000.pt \
+     --planner logs/acp_roban_stage2_v3_reset_noise_20261111_202310/ckpt_022000.pt \
+     --out evaluation_022000.json
+
+5. 查看训练参数：
+
+   ./run_roban.sh train_stage1 --help
+   ./run_roban.sh train_stage2 --help
+   ./run_roban.sh train_stage3 --help
+
+随包 checkpoint 是编号权重文件，包含 tracker、世界模型和 planner，不含 critic 与完整优化器状态。
+它可用于推理、测评及按训练入口支持的方式初始化；不能等价于 last.pt 的完整断点续训。
+
+保留内容：supermimic/、tools/、docker/、Roban 机器人资产、训练动作与接触标签、翻箱 holdout、启动脚本及 README/LICENSE。
+logs/ 中仅保留 Stage 2 的 ckpt_022000.pt，SHA256：
+95ad3c9a7e3b510ba866abd0a69d9fe46ad2ec5cb09b8e5021effddff66b0f7e
+
+不包含：data_collect_repo、docs、videos/vides、虚拟环境、.git、缓存、历史测试产物和其他 checkpoint。
+数据采集脚本保留源码，但上游 data_collect_repo 被按要求排除，不能直接运行该上游采集流程。
+G1/Isaac Lab 是仓库保留的另一条运行路线，其外部数据/环境没有包含在这个 Roban 分发包中。
+
+可迁移处理只发生在仓库外的分发副本：
+- run_roban.sh 默认使用解压目录的 .venv，也接受 ACP_PYTHON=/path/to/python。
+- checkpoint.py 读取时将原机器的仓库绝对配置路径映射到解压目录；checkpoint 文件及权重字节未改。
+- 新增 README_ENVIRONMENT.md、requirements-runtime.txt 和本说明。
+- mjlab 及其他 Python 依赖均不随包携带，按环境 README 在目标机器安装。
+- PACKAGE_MANIFEST.json 记录文件哈希；PACKAGE_VALIDATION.json 记录独立环境验证结果。
+
+当前源仓库不参与解压包运行，也没有因打包被修改。安装与启动后生成的 .venv、artifacts 等仅位于解压目录。

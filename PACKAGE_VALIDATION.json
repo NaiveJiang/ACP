@@ -1,0 +1,44 @@
+{
+  "verified_at": "2026-11-12T16:53:25.854815+08:00",
+  "source_files_checked": 1056,
+  "source_files_changed": [],
+  "distribution_copy_only_modifications": [
+    "run_roban.sh",
+    "supermimic/acp/checkpoint.py"
+  ],
+  "independent_venv": true,
+  "dependency_check": "128 packages, all compatible",
+  "environment": {
+    "python": "/home/liujunjie/packages/acp_runnable_20261112_164206/validation_venv/bin/python",
+    "torch": "2.10.0+cu128",
+    "cuda_build": "12.8",
+    "mujoco": "3.11.0",
+    "mjlab_file": "/home/liujunjie/packages/acp_runnable_20261112_164206/validation_venv/lib/python3.12/site-packages/mjlab/__init__.py",
+    "iteration": 22000,
+    "joint_count": 21,
+    "flat_motion_clips": 10,
+    "motion_directory": "/home/liujunjie/packages/acp_runnable_20261112_164206/Acp_supermimic_vibed/data/roban_motion",
+    "original_paths_blocked": [
+      "/home/liujunjie/Acp_supermimic_vibed/",
+      "/home/liujunjie/mjlab/",
+      "/home/liujunjie/InstinctMJ/.venv/"
+    ],
+    "checkpoint_config_relocated": true
+  },
+  "cpu_checkpoint_closed_loop": {
+    "iteration": 22000,
+    "steps": 100,
+    "sim_seconds": 2.0,
+    "numerical_warnings": 0
+  },
+  "gpu_smoke": {
+    "sim_steps": 8,
+    "num_envs": 2,
+    "gradient_finite": true,
+    "simulated_state_finite": true,
+    "actuator_count": 21
+  },
+  "environment_bundled": false,
+  "third_party_source_bundled": false,
+  "install_validation_note": "Installed mjlab from clean source at pinned commit into a separate venv, then removed that source from distribution. Git installation instructions target the same commit."
+}
