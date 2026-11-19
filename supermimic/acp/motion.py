@@ -57,6 +57,18 @@ def _resample(p: torch.Tensor, quat: torch.Tensor, j: torch.Tensor, fps: float):
     return lerp(p), quat_slerp(quat[i0], quat[i0 + 1], a), lerp(j)
 
 
+def measured_velocities(archive, rotations, device):
+    if not bool(archive.get("measured_velocities", False)):
+        return None
+    if float(archive["fps"].item()) != round(1 / CONTROL_DT):
+        raise ValueError("Measured rollout velocities require the native 50 Hz rate")
+    velocity = torch.tensor(archive["joint_vel"], dtype=torch.float32, device=device)
+    if velocity.shape != (len(rotations), 6 + NUM_J) or not torch.isfinite(velocity).all():
+        raise ValueError("Invalid measured velocity array")
+    world_angular = (rotations @ velocity[:, 3:6, None]).squeeze(-1)
+    return velocity[:, :3], world_angular, velocity[:, 6:]
+
+
 class MotionLib:
     def __init__(self, files: list[str], kin: RobotKinematics, device: str, root: str):
         self.device = device
@@ -74,7 +86,7 @@ class MotionLib:
         self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
 
         root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
-        for p, quat, j in zip(ps, qs, js):
+        for path, p, quat, j in zip(files, ps, qs, js, strict=True):
             R = quat_to_mat(quat)
             v = _gradient(p, CONTROL_DT)
             qd = _gradient(j, CONTROL_DT)
@@ -83,6 +95,10 @@ class MotionLib:
             w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
             w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
             w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
+            with np.load(path, allow_pickle=False) as archive:
+                measured = measured_velocities(archive, R, p.device)
+            if measured is not None:
+                v, w, qd = measured
             root_p.append(p), root_R.append(R), root_v.append(v), root_w.append(w), jq.append(j), jqd.append(qd)
         cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)

@@ -9,7 +9,7 @@ import torch
 from .mdp import normalize_xi, unflatten_state
 
 
-def rollout(wm, mdp, motion, s, a, xi, f, v, mask):
+def rollout(wm, mdp, motion, s, a, xi, f, v, mask, *, delay_steps=0, boxes=None):
     """Roll out only the valid prefix of each replay window, including its done step.
 
     The following episode's action/terrain must never be applied to the previous
@@ -21,8 +21,9 @@ def rollout(wm, mdp, motion, s, a, xi, f, v, mask):
         ids = mask[:, j].bool().nonzero(as_tuple=False).squeeze(-1)
         if ids.numel():
             active = tuple(x[ids] for x in state)
-            boxes = motion.boxes(f[ids, j], v[ids, j])
-            next_state = wm.step(active, a[ids, j], normalize_xi(xi[ids, j]), mdp.scan(active, boxes))
+            terrain = motion.boxes(f[ids, j], v[ids, j]) if boxes is None else boxes[ids, j]
+            context = normalize_xi(xi[ids, j], delay_steps)
+            next_state = wm.step(active, a[ids, j], context, mdp.scan(active, terrain))
             state = tuple(x.index_copy(0, ids, y) for x, y in zip(state, next_state))
         predictions.append(state)
     return tuple(torch.stack([p[i] for p in predictions], 1) for i in range(6))
@@ -31,7 +32,7 @@ def rollout(wm, mdp, motion, s, a, xi, f, v, mask):
 def regression_loss(wm, predictions, target, mask, error_floor):
     """Select valid transitions before arithmetic: NaN * 0 is still NaN."""
     valid = mask.bool()
-    std = torch.maximum(wm.out_norm.std(), error_floor)
+    std = torch.maximum(getattr(wm, "inc_norm", wm.out_norm).std(), error_floor)
     predicted = tuple(x[valid] for x in predictions)
     error = (wm.state_error(predicted, unflatten_state(target[valid])) / std).square().mean(-1)
     per_step = error.new_zeros(mask.shape).masked_scatter(valid, error)

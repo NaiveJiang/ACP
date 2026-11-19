@@ -24,7 +24,13 @@ def load_checkpoint(path, **kwargs):
         if key in checkpoint:
             checkpoint[key] = relocate(checkpoint[key])
     saved = checkpoint.get("robot")
-    expected = metadata()
+    args = checkpoint.get("args", {})
+    expected = metadata(s17_actuators=args.get("s17_actuators", False),
+                        primitive_soles=args.get("primitive_soles", False),
+                        legacy_primitive_soles=(
+                            saved is not None and "primitive_sole" in saved
+                            and "primitive_mjcf_sha256" not in saved
+                        ))
     if saved is None:
         if ROBOT_ID != "g1":
             raise ValueError(f"{path}: checkpoint has no robot metadata; cannot load as {ROBOT_ID}")
@@ -34,4 +40,7 @@ def load_checkpoint(path, **kwargs):
 
 
 def save_checkpoint(checkpoint, path, **kwargs):
-    torch.save({**checkpoint, "robot": metadata()}, path, **kwargs)
+    args = checkpoint.get("args", {})
+    robot = metadata(s17_actuators=args.get("s17_actuators", False),
+                     primitive_soles=args.get("primitive_soles", False))
+    torch.save({**checkpoint, "robot": robot}, path, **kwargs)

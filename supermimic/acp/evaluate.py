@@ -19,6 +19,9 @@ import json
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt", type=str, required=True)
+parser.add_argument("--ema", action="store_true", help="Evaluate the saved EMA policy")
+parser.add_argument("--ground-friction", type=float, default=None)
+parser.add_argument("--box-friction", type=float, default=None)
 parser.add_argument("--goal_s", type=float, default=1.0)
 parser.add_argument("--out", type=str, default=None, help="results json (default: next to the checkpoint)")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz)")
@@ -38,7 +41,7 @@ import torch
 from supermimic.acp.checkpoint import load_checkpoint
 
 import supermimic.acp.networks as networks
-from supermimic.acp.env import BOX_PARK, TrackingSim
+from supermimic.acp.env import TrackingSim, evaluation_surface_friction
 from supermimic.acp.robot import CONTACT_BODIES, MOTION_DIR, NB, ROBOT_ID, JOINT_NAMES, default_joint_pos_list
 from supermimic.acp.kinematics import RobotKinematics
 from supermimic.acp.mdp import MAX_STEP_REWARD, MDP, OBS_DIM, REF_ORI_DIMS, RewardCfg
@@ -46,6 +49,8 @@ from supermimic.acp.motion import CONTROL_DT, MotionLib
 from supermimic.acp.networks import Policy
 from supermimic.acp.planner import ContactPlanner, PlannerCfg, PlannerScan, plan
 from supermimic.acp.task import PLACE_WINDOW, ContactCfg, ContactTask, placement_error
+from supermimic.acp.reference_mimic import ReferenceCfg, ReferenceTask, build_policy
+from supermimic.acp.s17_actuation import DELAY_STEPS
 from supermimic.rotations import mat_to_quat
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -58,15 +63,32 @@ motion_dir = ia.get("motion_dir") or MOTION_DIR
 kin = RobotKinematics(dev)
 motion = MotionLib.from_dir(motion_dir, kin, dev)
 term_win = a_.get("term_window", 0.0) if args.term_window is None else args.term_window
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev), RewardCfg(term_window=int(round(term_win / CONTROL_DT))))
-ctc = ContactTask(ContactCfg(**ck["ctc_cfg"]), mdp, motion_dir, dev)
+delay_steps = DELAY_STEPS if a_.get("s17_actuators") else 0
+ground_friction, box_friction = evaluation_surface_friction(
+    a_, args.ground_friction, args.box_friction
+)
+friction_override = ground_friction is not None or box_friction is not None
+ground_friction = 1.0 if ground_friction is None else ground_friction
+box_friction = 1.0 if box_friction is None else box_friction
+mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
+          RewardCfg(term_window=int(round(term_win / CONTROL_DT)),
+                    w_knee_tracking=a_.get("knee_tracking_weight", 0.0),
+                    w_self_collision=a_.get("self_collision_weight", 0.0)),
+          independent_surface_friction=friction_override, delay_steps=delay_steps)
+reference_task = ck.get("task_interface") == "reference_mimic_v1"
+ctc = (ReferenceTask(ReferenceCfg(**ck["reference_cfg"]), mdp) if reference_task
+       else ContactTask(ContactCfg(**ck["ctc_cfg"]), mdp, motion_dir, dev))
 Hh = ia["hist"]
 networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-pi = Policy(OBS_DIM, ctc.cmd_dim, hist=Hh).to(dev)
-pi.load_state_dict(ck["pi"])
+pi = (build_policy(mdp, ctc, Hh) if reference_task else Policy(OBS_DIM, ctc.cmd_dim, hist=Hh)).to(dev)
+if args.ema and "pi_ema" not in ck:
+    raise ValueError("Checkpoint has no EMA policy")
+pi.load_state_dict(ck["pi_ema"] if args.ema else ck["pi"])
 pi.eval()
 
 if args.planner:
+    if reference_task:
+        raise ValueError("The reference Mimic baseline does not accept a contact planner")
     pk = load_checkpoint(args.planner, map_location=dev)
     pcfg = PlannerCfg(**pk["planner_cfg"])
     scan = PlannerScan(pcfg, dev)
@@ -77,7 +99,10 @@ if args.planner:
 C = len(motion.names)
 FOLDERS = sorted({n.split("/")[0] for n in motion.names})
 folder_of = torch.tensor([FOLDERS.index(n.split("/")[0]) for n in motion.names], device=dev)
-env = TrackingSim(C, motion, mdp, dev, eval_mode=True)
+env = TrackingSim(C, motion, mdp, dev, eval_mode=True, reference_reset_action=reference_task,
+                  ground_friction_range=(ground_friction,) * 2 if friction_override else None,
+                  box_friction_range=(box_friction,) * 2 if friction_override else None,
+                  primitive_soles=a_.get("primitive_soles", False))
 
 
 @torch.no_grad()
@@ -87,6 +112,8 @@ def evaluate() -> dict:
     clip_end = motion.clip_end
     gs = torch.full((C,), int(round(args.goal_s / CONTROL_DT)), device=dev)
     ret = torch.zeros(C, device=dev)
+    overlap_peak = torch.zeros(C, device=dev)
+    overlap_count = torch.zeros(C, dtype=torch.long, device=dev)
     tp, n_touch, n_label = (torch.zeros(NB, device=dev) for _ in range(3))
     prev_touch = torch.ones(C, NB, dtype=torch.bool, device=dev)
     tw_win = torch.zeros(PLACE_WINDOW, C, NB, 3, device=dev)
@@ -100,12 +127,17 @@ def evaluate() -> dict:
         if NOISE_OBS:
             o = mdp.add_noise(o)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        tw, tv = ctc.next_pos[env.f, env.v], ctc.next_valid[env.f, env.v]
+        if reference_task:
+            tw = torch.zeros(C, NB, 3, device=dev)
+            tv = torch.zeros(C, NB, device=dev, dtype=torch.bool)
+        else:
+            tw, tv = ctc.next_pos[env.f, env.v], ctc.next_valid[env.f, env.v]
         if args.planner:
             pw, pv = plan(planner, scan, pcfg, ctc, hist, S, env.f, env.v, gs, noise=NOISE_CMD)
             use = torch.rand(C, device=dev) < args.eta_obs
             tw, tv = torch.where(use[:, None, None], pw, tw), torch.where(use[:, None], pv, tv)
-        cmd = ctc.command(S, env.f, env.v, gs, noise=NOISE_CMD, targets_w=tw, valid=tv)
+        cmd = (ctc.command(S, env.f, env.v, gs) if reference_task else
+               ctc.command(S, env.f, env.v, gs, noise=NOISE_CMD, targets_w=tw, valid=tv))
         alive = ~env.done_eval.clone()
         tw_win, tv_win = torch.cat((tw_win[1:], tw[None])), torch.cat((tv_win[1:], tv[None]))
         if args.record:
@@ -113,42 +145,56 @@ def evaluate() -> dict:
             traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
             traj["tgt_w"].append(tw.cpu()), traj["tgt_valid"].append(tv.cpu())
         a = pi(hist, cmd)
-        out = env.step(a + 0.1 * torch.randn_like(a) if NOISE_ACT else a)
+        action = a + .1 * torch.randn_like(a) if NOISE_ACT else a
+        out = env.step(pi.project_action(action) if reference_task else action)
         ret += torch.where(alive, out["r"], 0.0)
+        if "self_overlap" in out:
+            overlap = torch.where(alive & out["valid"], out["self_overlap"], 0.0)
+            overlap_peak = torch.maximum(overlap_peak, overlap)
+            overlap_count += overlap > mdp.self_collision_penalty.tolerance
         f1 = out["f"] + 1
         S1 = env.state()
         boxes1 = motion.boxes(f1, out["v"])
-        touch = (ctc.body_distance(S1, boxes1) <= ctc.cfg.touch_dist) & alive.unsqueeze(-1)
-        pe = placement_error(ctc.contact_point(S1, boxes1), tw_win, tv_win)
-        place.append(torch.where(touch & ~prev_touch & pe.isfinite(), pe, torch.nan))
-        prev_touch = touch
-        label = ctc.labels[f1, out["v"]] & alive.unsqueeze(-1)
-        tp += (touch & label).sum(0)
-        n_touch += touch.sum(0)
-        n_label += label.sum(0)
+        if not reference_task:
+            touch = (ctc.body_distance(S1, boxes1) <= ctc.cfg.touch_dist) & alive.unsqueeze(-1)
+            pe = placement_error(ctc.contact_point(S1, boxes1), tw_win, tv_win)
+            place.append(torch.where(touch & ~prev_touch & pe.isfinite(), pe, torch.nan))
+            prev_touch = touch
+            label = ctc.labels[f1, out["v"]] & alive.unsqueeze(-1)
+            tp += (touch & label).sum(0)
+            n_touch += touch.sum(0)
+            n_label += label.sum(0)
         env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
         # Finished worlds no longer contribute to scores. Park their obstacles
         # before the next physics step: a fallen robot left on a heightfield can
         # otherwise exceed Warp's per-pair contact limit while other clips run.
         finished = (alive & env.done_eval).nonzero(as_tuple=False).flatten()
-        if len(finished):
-            env.sim.model.geom_pos[finished[:, None], env.box_geoms[None, :]] = torch.tensor(BOX_PARK, device=dev)
-            if env.hf_geom is not None:
-                env.sim.model.geom_pos[finished, env.hf_geom] = torch.tensor((0., 0., -100.), device=dev)
+        env.park_finished_terrains(finished)
     if args.record:
         np.savez_compressed(args.record, robot_id=np.array(ROBOT_ID), joint_names=np.array(JOINT_NAMES), names=np.array(motion.names), variant=env.v.cpu().numpy(),
+                            failed=env.failed_eval.cpu().numpy(),
                             boxes=motion.clip_boxes[torch.arange(C, device=dev), env.v].cpu().numpy(),
                             **{k: torch.stack(v).numpy() for k, v in traj.items()}, ref_root_p=motion.root_p.cpu().numpy(),
                             ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
                             clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
     norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
-    place = torch.stack(place).flatten(0, 1)
+    place = torch.stack(place).flatten(0, 1) if place else torch.empty(0, NB, device=dev)
     pl = [place[:, b][~place[:, b].isnan()] for b in range(NB)]
     rnd = lambda x: round(x.item(), 3)  # noqa: E731
     failed = env.failed_eval.float()
     return {
         "ckpt": args.ckpt,
-        "interface": "planner" if args.planner else "reference",
+        "policy_variant": "ema" if args.ema else "online",
+        "s17_actuators": bool(delay_steps),
+        "primitive_soles": env.primitive_soles,
+        **({"self_overlap": [
+            {"clip": name, "max_m": float(peak), "frames_over_1mm": int(count)}
+            for name, peak, count in zip(
+                motion.names, overlap_peak.tolist(), overlap_count.tolist(), strict=True
+            )
+        ]} if mdp.self_collision_penalty is not None else {}),
+        "surface_friction": {"ground": ground_friction, "box": box_friction},
+        "interface": "reference_mimic" if reference_task else "planner" if args.planner else "reference",
         "inactive_terrain_parked": True,
         "eta_obs": args.eta_obs if args.planner else 0.0,
         "term_window": term_win,
@@ -163,7 +209,7 @@ def evaluate() -> dict:
                          "placement_err": rnd(pl[b].mean()) if len(pl[b]) else None,
                          "placement_median": rnd(pl[b].median()) if len(pl[b]) else None,
                          "placement_within_0.1": rnd((pl[b] <= 0.1).float().mean()) if len(pl[b]) else None,
-                         "onsets": len(pl[b])} for b, n in enumerate(CONTACT_BODIES)},  # fmt: skip
+                         "onsets": len(pl[b])} for b, n in enumerate(CONTACT_BODIES)} if not reference_task else {},  # fmt: skip
     }
 
 

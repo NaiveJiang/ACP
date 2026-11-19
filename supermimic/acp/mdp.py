@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .robot import NUM_J, SOFT_JOINT_LIMIT_FACTOR
+from .robot import JOINT_NAMES, NUM_J, SOFT_JOINT_LIMIT_FACTOR
 from .kinematics import RobotKinematics
 from .motion import CONTROL_DT, MotionLib
 from .terrain import CRITIC_SCAN, grid_offsets, height_scan
@@ -42,6 +42,8 @@ class RewardCfg:
     root_ori_std: float = 0.4
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
+    w_knee_tracking: float = 0.0
+    w_self_collision: float = 0.0
     soft_limit_factor: float = SOFT_JOINT_LIMIT_FACTOR
     term_height: float = 0.25
     term_tilt: float = 0.8
@@ -72,21 +74,36 @@ def invariant_features(S) -> torch.Tensor:
 INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
 
 
-def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
-    return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1 : 1 + NUM_J] / 0.01, xi[..., 1 + NUM_J :] / 0.05), -1)
+def normalize_xi(xi: torch.Tensor, delay_steps: int = 0) -> torch.Tensor:
+    surface_dim = xi.shape[-1] - delay_steps * NUM_J
+    return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1 : 1 + NUM_J] / 0.01,
+                      xi[..., 1 + NUM_J : XI_DIM] / 0.05,
+                      (xi[..., XI_DIM:surface_dim] - 0.75) / 0.45, xi[..., surface_dim:]), -1)
 
 
 class MDP:
-    def __init__(self, kin: RobotKinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg()):
+    def __init__(self, kin: RobotKinematics, motion: MotionLib, default_q: torch.Tensor,
+                 cfg: RewardCfg = RewardCfg(), *, independent_surface_friction: bool = False,
+                 delay_steps: int = 0):
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
+        self.self_collision_penalty = None
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
         dev = default_q.device
+        self.knee_ids = None
+        if cfg.w_knee_tracking:
+            names = ("leg_l4_joint", "leg_r4_joint")
+            if any(name not in JOINT_NAMES for name in names):
+                raise ValueError("Knee tracking cost requires RoBan joints")
+            self.knee_ids = torch.tensor([JOINT_NAMES.index(name) for name in names], device=dev)
         self.obs_noise = OBS_NOISE.to(dev)
         self.scan_offsets = grid_offsets(*CRITIC_SCAN, device=dev)
         self.scan_dim = self.scan_offsets.shape[0]
-        self.critic_extra = NUM_J + len(kin.tracked_idx) * 3 + 3 + 6 + XI_DIM + self.scan_dim
+        self.surface_context_dim = XI_DIM + int(independent_surface_friction)
+        self.delay_steps = delay_steps
+        self.context_dim = self.surface_context_dim + delay_steps * NUM_J
+        self.critic_extra = NUM_J + len(kin.tracked_idx) * 3 + 3 + 6 + self.context_dim + self.scan_dim
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi) -> torch.Tensor:
@@ -106,12 +123,23 @@ class MDP:
         return height_scan(S[0], S[1], boxes, self.scan_offsets)
 
     # ---------------- reward / termination ----------------
-    def reward(self, S, f, a, a_prev):
+    def reward(self, S, f, a, a_prev, *, return_self_overlap=False):
         """SuperMimic's tracking reward (already multiplied by dt) of S on reference frame f: the simulator's
         reward, which drives the start-bin sampling and the logs (the contact policy learns from its own)."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
-        bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
+        penalty = self.self_collision_penalty
+        if penalty is None:
+            bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
+            overlap = None
+        else:
+            bp_all, bR_all, bv_all, bw_all = self.kin.forward(
+                p, R, v, w, q, qd, all_bodies=True
+            )
+            overlap = penalty.depth(bp_all, bR_all)
+            ids = self.kin.tracked_idx
+            bp, bR = bp_all[..., ids, :], bR_all[..., ids, :, :]
+            bv, bw = bv_all[..., ids, :], bw_all[..., ids, :]
         rp, rR = m.root_p[f], m.root_R[f]
         # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
         dR = yaw_mat(R @ rR.transpose(-1, -2))
@@ -129,7 +157,17 @@ class MDP:
                    + 0.5 * torch.exp(-e_ro / c.root_ori_std**2))  # fmt: skip
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        return (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
+        if self.knee_ids is not None:
+            knee_cost = torch.nn.functional.smooth_l1_loss(
+                q[..., self.knee_ids], m.q[f][..., self.knee_ids], beta=0.25, reduction="none",
+            ).sum(-1)
+            r_track = r_track - c.w_knee_tracking * knee_cost
+        reward = r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim
+        if overlap is not None:
+            depth = (overlap - penalty.tolerance).clamp_min(0)
+            reward = reward - c.w_self_collision * (depth / penalty.normalization).square()
+        reward = reward * CONTROL_DT
+        return (reward, overlap) if return_self_overlap else reward
 
     def best_frame(self, p: torch.Tensor, R: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
         """The reference frame within ``term_window`` of f (inside f's clip) whose root height and tilt the root
