@@ -56,15 +56,16 @@ def main():
     for number, (path, ck) in enumerate(zip(args.checkpoints, checkpoints)):
         torch.manual_seed(123)
         backend = backend_for_format(ck['format'])
+        joint=getattr(backend,'joint',False)
         config = ck['config']
         h = next(i for i,t in enumerate(config['horizons']) if abs(t-args.query_dt)<1e-6)
         kin = RobotKinematics(args.device)
         motion = FootstepMotion([selected], kin, args.device, config['horizons'])
         task = backend.Task(motion, kin, backend.RewardCfg(**ck['reward']))
         mdp = backend.MDP(kin, motion, torch.tensor(default_joint_pos_list(),device=args.device), task)
-        pi = backend.Policy(config['hist'],config['policy_hidden']).to(args.device).eval()
+        pi = backend.Policy(config['hist'],config['policy_hidden'],**(dict(planner_config=config['planner_config']) if joint else {})).to(args.device).eval()
         pi.load_state_dict(ck['pi'])
-        env = FootstepTrackingSim(1,motion,mdp,args.device,eval_mode=True,reset_noise=False)
+        env = getattr(backend,'Env',FootstepTrackingSim)(1,motion,mdp,args.device,eval_mode=True,reset_noise=False)
         start = motion.clip_start[0]+int(args.phase*(int(motion.clip_len[0])-1))
         env.reset(torch.tensor([0],device=args.device),frames=start.reshape(1)); env.refresh()
         first = np.r_[env.sim.data.qpos[0].cpu().numpy(),env.sim.data.qvel[0].cpu().numpy()]
@@ -99,8 +100,12 @@ def main():
                     obs = env.observe()
                     history = (obs[:,None].expand(-1,config['hist'],-1).clone() if history is None
                                else torch.cat((history[:,1:],obs[:,None]),1))
+                    if joint:query.copy_(task.pack_queries(env.f,query))
                     command = task.command(env.state(),env.f,query)
-                    action = pi(history,command)
+                    if joint:
+                        command=pi.contact_plan(history,command)
+                        action=pi.controller_action(history,command)
+                    else:action = pi(history,command)
                     tr = env.step(action)
                     S = unflatten_state(tr['s1']); f = tr['f']+1
                     sole,_,gap = task.foot_geometry(S)
@@ -119,6 +124,10 @@ def main():
                             upper_pose=float(c.upper_pose_weight*torch.exp(-upper_error/c.upper_pose_std**2)[0]),
                             action_rate=float(c.action_rate_weight*(action-previous).square().sum()),
                             joint_speed=float(c.joint_speed_weight*S[5].square().sum())))
+                        if hasattr(mdp, 'regularization_terms'):
+                            reg = mdp.regularization_terms(S, f, action, previous)
+                            contributions[-1]['upper_pose'] = float(-c.upper_pose_weight*reg['upper_pose'][0])
+                            contributions[-1]['upper_velocity'] = float(-c.upper_velocity_weight*reg['upper_velocity'][0])
                     previous = action
                     if renderer:
                         data.qpos[:] = records['qpos'][-1]

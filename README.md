@@ -5,7 +5,15 @@
 
 # ACP-G1 <!-- TODO: final project name -->
 
-**当前 RoBan 接触控制 / Blink 快速训练环境：** 新机器执行 `bash install_env.sh --system-deps`，自动创建 `.venv_footstep` 并安装固定版本依赖；详见 [一键安装说明](README_INSTALL.md)。v3 控制器训练见 [README_STABLE_CONTACT.md](README_STABLE_CONTACT.md)。
+**RoBan 全身跟踪器与 Learned Motion Matching：** 同一 checkout 提供 BlinkMimic 全身参考训练、EMA 跟踪验收和六帧 LMM 规划接口。见 [训练与验收流程](README_BLINK_MIMIC.md#roban-平地跟踪器与-lmm)。
+
+**联合训练修正版 v8：** 增加未来目标实现、真实未来反馈、平地支撑高度投影与脚底防滑，使用 `run_contact_joint_consistent.sh`，从 v6 重新初始化；见 [README_CONSISTENT_JOINT.md](README_CONSISTENT_JOINT.md)。
+
+**速度规划器＋控制器联合微调 v7：** `run_contact_joint.sh`，初始化现有 v6 控制器与离线规划器，两者共同优化，速度只进入规划器；见 [README_JOINT_CONTACT.md](README_JOINT_CONTACT.md)。
+
+**最新接触控制任务 v6：** 双腿物理自碰撞、可微避碰代价、自然步态软约束和上身监督，使用 `run_contact_tracker_collision.sh`，默认 EMA 0.995、无世界模型单独预训练；见 [README_LEG_COLLISION.md](README_LEG_COLLISION.md)。
+
+**当前 RoBan 接触控制 / Blink 快速训练环境：** 新机器执行 `bash install_env.sh --system-deps`，自动创建 `.venv_footstep` 并安装固定版本依赖；详见 [一键安装说明](README_INSTALL.md)。最新 v5 自然步态软约束见 [README_GAIT_STYLE.md](README_GAIT_STYLE.md)，旧 v4 见 [README_UPPER_SUPERVISED.md](README_UPPER_SUPERVISED.md)，旧 v3 见 [README_STABLE_CONTACT.md](README_STABLE_CONTACT.md)。
 
 **代码导览（中文）：** [代码结构与执行流程](docs/code_structure_zh.md) · [文档导航](docs/README.md)
 

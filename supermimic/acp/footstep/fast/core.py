@@ -41,10 +41,13 @@ def gated_step(loss, model, optimizer, eligible=None):
 
 class Updates:
     def __init__(self, wm, policy, critic, mdp, task, opt_wm, opt_pi, opt_v,
-                 horizon=16, gamma=.99, lam=.95, critic_epochs=2, compile=True, ema=0.):
+                 horizon=16, gamma=.99, lam=.95, critic_epochs=2, compile=True, ema=0.,
+                 critic_minibatches=1, event=None):
         self.wm, self.policy, self.critic, self.mdp, self.task = wm, policy, critic, mdp, task
         self.opt_wm, self.opt_pi, self.opt_v = opt_wm, opt_pi, opt_v
         self.horizon, self.gamma, self.lam, self.critic_epochs = horizon, gamma, lam, critic_epochs
+        self.critic_minibatches = critic_minibatches
+        self.event = event
         self.ema = ema
         self.average = copy.deepcopy(policy).requires_grad_(False) if ema else None
         device = next(wm.parameters()).device
@@ -60,6 +63,19 @@ class Updates:
         self.reward = self._reward
         self.critic_input = mdp.critic_input
         self.value_targets = self._value_targets
+        self.upper_supervision = task.supervision_loss if hasattr(task, 'supervision_loss') else None
+        self.joint_supervision = task.joint_supervision_loss if hasattr(task,'joint_supervision_loss') else None
+        self.trajectory_supervision=getattr(task,'trajectory_supervision_loss',None)
+        if compile and self.trajectory_supervision is not None:
+            self.trajectory_supervision=torch.compile(self.trajectory_supervision,fullgraph=True,dynamic=False,
+                                                     options={'max_fusion_size':32})
+        self.query_reward = hasattr(mdp,'reward_with_query')
+        if compile and self.joint_supervision is not None:
+            self.joint_supervision=torch.compile(self.joint_supervision,fullgraph=True,dynamic=False,
+                                                options={'max_fusion_size':32})
+        if compile and self.upper_supervision is not None:
+            self.upper_supervision = torch.compile(self.upper_supervision, fullgraph=True, dynamic=False,
+                                                    options={'max_fusion_size':32})
         if compile:
             options = {'max_fusion_size':32}
             for attr in ('wm_loss','imag_step','reward','critic_input','value_targets'):
@@ -105,14 +121,26 @@ class Updates:
         self.note(0,good)
         return torch.stack((loss.detach(),grad.detach(),good.float()))
 
-    def _imag_step(self, S, hist, f, query, xi):
-        action = self.policy(hist,self.task.command(S,f,query))
+    def _imag_step(self, S, hist, f, query, xi, use_plan=None):
+        if self.event is not None:
+            from ..event_planner import world_plan
+            plan = self.event.plan(hist,S,f,query)
+            targets = torch.where(use_plan[:,None],plan,self.task.command(S,f,query))
+            action = self.policy(hist,targets)
+            plan = (self.event.world_plan(plan,S,f,query) if hasattr(self.event,'world_plan')
+                    else world_plan(plan,S))
+        elif self.trajectory_supervision is not None:
+            plan=self.policy.planning_outputs(hist,self.task.command(S,f,query))
+            action=self.policy.controller_action(hist,plan[:,:13])
+        else:action = self.policy(hist,self.task.command(S,f,query))
         S1 = self.wm.step(S,action,normalize_xi(xi),flat_scan(S,self.mdp.scan_dim))
         obs = self.mdp.add_noise(self.mdp.obs(S1,action,xi))
-        return S1,torch.cat((hist[:,1:],obs[:,None]),1),action
+        result=(S1,torch.cat((hist[:,1:],obs[:,None]),1),action)
+        return (*result,plan) if self.event is not None or self.trajectory_supervision is not None else result
 
-    def _reward(self, S, f, a, prev):
-        return self.mdp.reward(S,f,a,prev),self.mdp.soft_termination(S,f)
+    def _reward(self, S, f, a, prev, query=None):
+        reward=self.mdp.reward_with_query(S,f,a,prev,query) if self.query_reward else self.mdp.reward(S,f,a,prev)
+        return reward,self.mdp.soft_termination(S,f)
 
     def _value_targets(self, values, rewards, dones):
         target = values[-1]
@@ -126,15 +154,27 @@ class Updates:
         S = unflatten_state(batch['s'])
         hist,f,query,xi = batch['hist'],batch['f'],batch['goal_steps'],batch['xi']
         states,frames,actions,previous = [S],[f],[],[batch['a_prev']]
+        plans=[]
+        if self.event is not None:
+            use_plan = torch.rand(len(f),device=f.device) < batch["eta_obs"]
         freeze(self.wm,True); freeze(self.critic,True)
         try:
             for _ in range(self.horizon):
-                S,hist,a = self.imag_step(S,hist,f,query,xi)
+                if self.event is not None:
+                    S,hist,a,plan = self.imag_step(S,hist,f,query,xi,use_plan)
+                    plans.append(plan)
+                elif self.trajectory_supervision is not None:
+                    S,hist,a,plan=self.imag_step(S,hist,f,query,xi);plans.append(plan)
+                else:S,hist,a = self.imag_step(S,hist,f,query,xi)
                 f = f+1
                 states.append(S);frames.append(f);actions.append(a);previous.append(a)
             flat = lambda xs: torch.stack(xs).flatten(0,1)
             predicted = tuple(flat([s[k] for s in states[1:]]) for k in range(6))
-            r,d = self.reward(predicted,flat(frames[1:]),flat(actions),flat(previous[:-1]))
+            if self.query_reward:
+                r,d=self.reward(predicted,flat(frames[1:]),flat(actions),flat(previous[:-1]),query.repeat(self.horizon))
+            else:r,d = self.reward(predicted,flat(frames[1:]),flat(actions),flat(previous[:-1]))
+            if self.event is not None:
+                r = r + batch["eta_reward"]*self.event.imagined_delta(predicted,frames,query,plans,use_plan)
             r,d = r.view(self.horizon,-1),d.view(self.horizon,-1)
             # BlinkMimic: explicit products avoid cumprod-backward host checks.
             alive,trajectory = torch.ones_like(d[0]),[]
@@ -147,7 +187,19 @@ class Updates:
             objective = (discount*survival*r).sum(0)+self.gamma**self.horizon*alive*boot
             usable = batch['usable'].float()
             loss = -(objective*usable).sum()/usable.sum().clamp_min(1)
-            good,grad = gated_step(loss,self.policy,self.opt_pi,batch['usable'].any())
+            if self.upper_supervision is not None:
+                upper_loss = self.upper_supervision(self.policy, batch)
+                loss = loss+self.task.cfg.upper_supervision_weight*upper_loss
+            if self.joint_supervision is not None:
+                joint_loss=self.joint_supervision(self.policy,batch)
+                loss=loss+joint_loss
+            if self.trajectory_supervision is not None:
+                stacked=tuple(torch.stack([s[k] for s in states]) for k in range(6))
+                realization_loss=self.trajectory_supervision(stacked,query,torch.stack(plans),batch['usable'],survival,alive)
+                loss=loss+realization_loss
+            eligible=(batch['usable'].any() if self.joint_supervision is None
+                      else torch.ones((),device=loss.device,dtype=torch.bool))
+            good,grad = gated_step(loss,self.policy,self.opt_pi,eligible)
             self.note(1,good)
         finally:
             freeze(self.wm,False);freeze(self.critic,False)
@@ -160,18 +212,29 @@ class Updates:
             self.critic.norm.update(X,batch['usable'].repeat(self.horizon+1))
             targets = self.value_targets(self.critic(X),r.detach(),d.detach()).flatten()
             X = X[:-1].flatten(0,1)
+        weights = batch['usable'].float().repeat(self.horizon)
         for _ in range(self.critic_epochs):
-            weights=batch['usable'].float().repeat(self.horizon)
-            v_loss = ((self.critic(X)-targets).square()*weights).sum()/weights.sum().clamp_min(1)
-            vg,_ = gated_step(v_loss,self.critic,self.opt_v,batch['usable'].any())
-            self.note(2,vg)
+            groups = ((slice(None),) if self.critic_minibatches == 1 else
+                      torch.randperm(len(X), device=X.device).chunk(self.critic_minibatches))
+            for indices in groups:
+                weight = weights[indices]
+                v_loss = ((self.critic(X[indices])-targets[indices]).square()
+                          * weight).sum()/weight.sum().clamp_min(1)
+                eligible = weight.bool().any()
+                vg, _ = gated_step(v_loss,self.critic,self.opt_v,eligible)
+                self.note(2,vg | (~eligible & weights.bool().any()))
         if self.average is not None:
             with torch.no_grad():
                 for avg,live in zip(self.average.parameters(),self.policy.parameters()):
                     avg.copy_(torch.where(good,avg.lerp(live,1-self.ema),avg))
                 for avg,live in zip(self.average.buffers(),self.policy.buffers()):
                     avg.copy_(live)
-        return torch.stack((loss.detach(),v_loss.detach(),grad.detach(),alive.mean().detach(),good.float()))
+        metrics = [loss.detach(),v_loss.detach(),grad.detach(),alive.mean().detach(),good.float()]
+        if self.upper_supervision is not None:
+            metrics.append(upper_loss.detach())
+        if self.joint_supervision is not None:metrics.append(joint_loss.detach())
+        if self.trajectory_supervision is not None:metrics.append(realization_loss.detach())
+        return torch.stack(metrics)
 
 
 class CudaUpdate:

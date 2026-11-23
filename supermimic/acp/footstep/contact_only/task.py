@@ -14,10 +14,12 @@ COMMAND_DIM = 13
 
 
 class ContactOnlyPolicy(TrackerPolicy):
+    command_dim = COMMAND_DIM
+
     def __init__(self, hist=5, hidden=(512, 256, 128)):
         super().__init__(hist, hidden)
-        self.enc = mlp(COMMAND_DIM, [128, 128], 32)
-        self.goal_norm = RunningNorm(COMMAND_DIM)
+        self.enc = mlp(self.command_dim, [128, 128], 32)
+        self.goal_norm = RunningNorm(self.command_dim)
 
 
 @dataclass

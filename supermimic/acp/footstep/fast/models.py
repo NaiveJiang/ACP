@@ -13,6 +13,12 @@ from ....rotations import axis_angle_to_mat, yaw_mat, mat_to_6d, so3_log, skew
 from ..task import FootstepTask
 from ..contact_only.task import ContactOnlyTask
 from ..stable_contact import StableContactTask
+from ..upper_supervised import UpperSupervisedTask
+from ..gait_style import GaitStyleTask
+from ..leg_collision import LegCollisionTask
+from ..body_goal import BodyGoalTask
+from ..joint import JointTask
+from ..consistent_joint import ConsistentJointTask
 
 
 def mm3(a, b):
@@ -139,6 +145,44 @@ class FastContactTask(Geometry, ContactOnlyTask):
 
 
 class FastStableContactTask(Geometry, StableContactTask):
+    pass
+
+
+class FastUpperSupervisedTask(Geometry, UpperSupervisedTask):
+    pass
+
+
+class FastGaitStyleTask(Geometry, GaitStyleTask):
+    pass
+
+
+from ..next_contact import NextContactTask
+
+
+class FastNextContactTask(Geometry, NextContactTask):
+    pass
+
+
+class FastLegCollisionTask(Geometry, LegCollisionTask):
+    pass
+
+
+class FastBodyGoalTask(Geometry, BodyGoalTask):
+    pass
+
+
+class FastJointTask(Geometry, JointTask):
+    pass
+
+
+from ..walking_planner import WalkingPlannerTask
+
+
+class FastWalkingPlannerTask(Geometry, WalkingPlannerTask):
+    pass
+
+
+class FastConsistentJointTask(Geometry, ConsistentJointTask):
     pass
 
 

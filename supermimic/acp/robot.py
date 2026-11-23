@@ -81,7 +81,7 @@ def friction_torque(velocity):
     return 0.0
 
 
-def metadata():
+def metadata(s17_actuators=False, *, primitive_soles=False, legacy_primitive_soles=False):
     """Portable checkpoint contract (no absolute asset or dataset paths)."""
     data = {"id": ROBOT_ID, "joint_names": JOINT_NAMES, "root_body": ROOT_BODY,
         "torso_body": TORSO_BODY, "com_body": COM_BODY, "tracked_bodies": TRACKED_BODIES,
@@ -97,6 +97,18 @@ def metadata():
         "mjcf_sha256": hashlib.sha256(Path(MJCF_PATH).read_bytes()).hexdigest(),
         "state_dim": 13 + 2 * NUM_J, "xi_dim": NUM_J + 4,
         "friction_policy": "acp_uniform_geom_friction", "delay_steps": 0}
+    if s17_actuators:
+        if ROBOT_ID != "roban":
+            raise ValueError("S17 actuator metadata requires the RoBan robot")
+        data.update(_backend.s17_control_metadata())
+    if primitive_soles:
+        if ROBOT_ID != "roban":
+            raise ValueError("Primitive-sole metadata requires the RoBan robot")
+        data["primitive_sole"] = _backend.primitive_sole_metadata()
+        source_xml = Path(_backend.PRIMITIVE_MJCF_PATH)
+        sha = hashlib.sha256(source_xml.read_bytes()).hexdigest()
+        if not legacy_primitive_soles or sha != _backend.LEGACY_PRIMITIVE_MJCF_SHA256:
+            data["primitive_mjcf_sha256"] = sha
     # Normalize tuples for stable equality after JSON/torch serialization.
     data = json.loads(json.dumps(data))
     data["fingerprint"] = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()

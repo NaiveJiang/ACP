@@ -1,5 +1,11 @@
 # 一键安装当前训练环境
 
+最新联合训练 v8 见 [README_CONSISTENT_JOINT.md](README_CONSISTENT_JOINT.md)，使用当前依赖，无需重新安装。
+
+速度规划器与控制器联合微调 v7 见 [README_JOINT_CONTACT.md](README_JOINT_CONTACT.md)，复用当前依赖；新设备还需复制初始化用的控制器和规划器权重。
+
+最新双腿自碰撞训练 v6 见 [README_LEG_COLLISION.md](README_LEG_COLLISION.md)，使用同一环境，不需要新增依赖。
+
 本入口服务于当前 RoBan 接触控制器、离线规划器和 Blink 加速训练，支持 Linux x86_64（Ubuntu/Debian 可自动安装系统库）。不需要先安装 Python、Conda 或本地 CUDA Toolkit；GPU 机器需要先有可用的 NVIDIA 驱动，容器内还需要暴露 GPU。
 
 ## 新设备安装
@@ -56,7 +62,7 @@ Git 忽略了 `data/`、`logs/` 和录制数据。依赖安装不会下载它们
 
 `.venv` 等目录不能直接复制到其他设备，里面的 Python 路径和二进制依赖可能不匹配；应使用本脚本重建。旧 ACP 启动入口如使用 `ACP_PYTHON`，可显式设置为 `"$PWD/.venv_footstep/bin/python"`；接触任务入口默认已使用 `.venv_footstep`。
 
-v3 训练和播放见 [README_STABLE_CONTACT.md](README_STABLE_CONTACT.md)，快速引擎参数见 [README_FAST_CONTACT.md](README_FAST_CONTACT.md)。原始 Isaac Lab/Docker 路线继续使用 `tools/setup.sh`，不由本脚本安装。
+最新 v5 训练和播放见 [README_GAIT_STYLE.md](README_GAIT_STYLE.md)，旧 v4 见 [README_UPPER_SUPERVISED.md](README_UPPER_SUPERVISED.md)，旧 v3 见 [README_STABLE_CONTACT.md](README_STABLE_CONTACT.md)，快速引擎参数见 [README_FAST_CONTACT.md](README_FAST_CONTACT.md)。原始 Isaac Lab/Docker 路线继续使用 `tools/setup.sh`，不由本脚本安装。
 
 安装机制参考 [uv 安装文档](https://docs.astral.sh/uv/getting-started/installation/) 和 [uv PyTorch 后端文档](https://docs.astral.sh/uv/guides/integration/pytorch/)。
 

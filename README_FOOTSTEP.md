@@ -1,5 +1,7 @@
 # 双脚接触规划器实验
 
+> 规划器与 v6 接触控制器的联合微调已接入 v7，见 [README_JOINT_CONTACT.md](README_JOINT_CONTACT.md)。本页继续保留离线规划器训练与数据说明。
+
 新增的真实接触目标控制器任务见 [README_FOOTSTEP_TRACKER.md](README_FOOTSTEP_TRACKER.md)；本页仍介绍离线规划器。
 
 此实验位于 `supermimic/acp/footstep/`，使用独立 Python 环境 `.venv_footstep`、启动脚本 `run_footstep.sh` 和输出目录。原版九部位 ACP 的 `planner.py`、`task.py`、`env.py`、各 Stage 训练及启动脚本保持不变。此阶段是离线监督训练，不运行仿真，也不修改接触跟踪器或世界模型。

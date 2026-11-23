@@ -22,6 +22,36 @@ STATE_FIELDS = ["gravity_body[3]", "angular_velocity_body[3]", "joint_position[2
 STATE_DIM = 48
 CACHE_VERSION = 1
 ARRAYS = ("state", "velocity", "dt", "contact", "position", "heading")
+KINEMATIC_REFERENCE = "roban_kinematic_reference_v1"
+
+
+def reference_fingerprint(path, metadata_text):
+    stat = path.stat()
+    identity = json.dumps([str(path), stat.st_size, stat.st_mtime_ns, metadata_text, CACHE_VERSION, JOINT_NAMES])
+    return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+
+def kinematic_descriptors(source, manifest):
+    if manifest.get("status") != "complete":
+        raise ValueError("Incomplete kinematic reference: " + str(source))
+    metadata_text = (source.parent/"metadata.json").read_text()
+    metadata = json.loads(metadata_text)
+    if metadata["sample_hz"] != 50 or metadata.get("contact_source") != "kinematic":
+        raise ValueError("Kinematic reference requires 50 Hz and explicit contact estimates")
+    result = []
+    for item in manifest["clips"]:
+        name = item["case"]
+        if Path(name).name != name or name in (".", "..") or item["partition"] not in ("train", "val"):
+            raise ValueError("Invalid kinematic clip name or split")
+        path = source/(name+"_labels.npz")
+        minimum = manifest["min_support_steps"]
+        if not isinstance(minimum, int) or not 4 <= minimum <= 10:
+            raise ValueError("Invalid kinematic stance duration")
+        result.append(dict(source=str(source), case=name, frames=item["frames"], category=item["category"],
+                           partition=item["partition"], raw_motion=item["raw_motion"], fps=50.,
+                           min_support_steps=minimum, reference_schema=KINEMATIC_REFERENCE,
+                           cache=None, fingerprint=reference_fingerprint(path, metadata_text)))
+    return result
 
 
 def observations(qpos, qvel, metadata):
@@ -54,6 +84,9 @@ def prepare(sources, cache_dir):
             raise ValueError("Duplicate dataset: " + str(source))
         seen_sources.add(str(source))
         manifest = json.loads((source / "manifest.json").read_text())
+        if manifest.get("schema") == KINEMATIC_REFERENCE:
+            clips.extend(kinematic_descriptors(source, manifest))
+            continue
         if manifest.get("schema_version") != 2 or manifest.get("status") != "complete":
             raise ValueError("Need complete future_contact_v2 dataset: " + str(source))
         horizons = manifest["horizons_s"]
@@ -68,10 +101,7 @@ def prepare(sources, cache_dir):
             if Path(name).name != name or name in (".", ".."):
                 raise ValueError("Unsafe case name")
             path = source / (name + "_labels.npz")
-            stat = path.stat()
-            fingerprint = json.dumps([str(path), stat.st_size, stat.st_mtime_ns, metadata_text,
-                                      CACHE_VERSION, JOINT_NAMES])
-            key = hashlib.sha256(fingerprint.encode()).hexdigest()[:24]
+            key = reference_fingerprint(path, metadata_text)
             target = cache_dir / key
             if not (target / "info.json").exists():
                 temp = Path(tempfile.mkdtemp(prefix=key + ".", dir=cache_dir))
@@ -112,10 +142,13 @@ def split_clips(clips, val_fraction=.2, seed=42):
     if not 0 < val_fraction < 1:
         raise ValueError("val_fraction must be in (0,1)")
     groups = defaultdict(list)
-    for clip in clips:
-        groups[(clip["source"], clip["category"])].append(clip)
-    rng = np.random.default_rng(seed)
     result = {"train": [], "val": []}
+    for clip in clips:
+        if clip.get("reference_schema") == KINEMATIC_REFERENCE:
+            result[clip["partition"]].append(dict(clip, start=0, end=clip["frames"]))
+        else:
+            groups[(clip["source"], clip["category"])].append(clip)
+    rng = np.random.default_rng(seed)
     for group in groups.values():
         if len(group) > 1:
             nval = min(len(group)-1, max(1, math.ceil(len(group)*val_fraction)))
@@ -138,6 +171,8 @@ class ContactDataset(Dataset):
         self.entries, self.ends, self.cache = [], [], OrderedDict()
         count = 0
         for interval in intervals:
+            if interval.get("reference_schema") == KINEMATIC_REFERENCE:
+                raise ValueError("Kinematic reference clips are for contact controllers, not fixed-time planner datasets")
             folder = Path(interval["cache"])
             valid = np.load(folder / "valid.npy", mmap_mode="r").copy()
             future = np.load(folder / "future_index.npy", mmap_mode="r")

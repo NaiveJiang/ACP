@@ -1,5 +1,7 @@
 # 上身与抖动修正版（v3）
 
+> 最新上身直接动作监督使用 `run_contact_tracker_upper.sh`，见 [v4 说明](README_UPPER_SUPERVISED.md)。本页和 v3 入口保留用于原权重播放、续训和对照。
+
 入口 `run_contact_tracker_stable.sh` 使用 Blink 快速训练引擎，默认编译、CUDA Graph、BF16。旧 16 维、旧 13 维入口及权重保持原行为。正式训练由用户自行启动；开发验证只运行了 4 次更新的小规模检查。
 
 ## 修正内容

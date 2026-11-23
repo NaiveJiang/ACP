@@ -80,9 +80,9 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 class WorldModel(nn.Module):
     """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments."""
 
-    def __init__(self, scan_dim: int, hidden=(2048, 2048, 2048)):
+    def __init__(self, scan_dim: int, hidden=(2048, 2048, 2048), *, context_dim: int = XI_DIM):
         super().__init__()
-        self.in_dim = INV_DIM + NUM_J + XI_DIM + scan_dim
+        self.in_dim = INV_DIM + NUM_J + context_dim + scan_dim
         self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)

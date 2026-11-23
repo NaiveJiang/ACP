@@ -1,20 +1,19 @@
 """Measured 50 Hz reference states and oracle contacts, isolated from the legacy loader."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .data import CACHE_VERSION, JOINT_NAMES
+from .data import KINEMATIC_REFERENCE, JOINT_NAMES, reference_fingerprint
 from ..motion import MotionLib
 from ...rotations import quat_to_mat
 
 
 class FootstepMotion(MotionLib):
-    def __init__(self, intervals, kin, device, horizons=(.1, .2, .3, .5, .8, 1.), max_clips=0):
+    def __init__(self, intervals, kin, device, horizons=(.1, .2, .3, .5, .8, 1.), max_clips=0, *, reserve_steps=0):
         if max_clips:
             intervals = intervals[:max_clips]
         self.device = device
@@ -24,8 +23,8 @@ class FootstepMotion(MotionLib):
                 or not np.allclose(steps*.02, horizons, atol=1e-7, rtol=0)):
             raise ValueError("Horizons must be distinct positive 20 ms multiples")
         self.horizon_steps = torch.tensor(steps, device=device)
-        margin = int(steps.max())
-        arrays = {k: [] for k in ("p", "R", "v", "w", "q", "qd", "feet", "contact", "velocity")}
+        margin = max(int(steps.max()), reserve_steps)
+        arrays = {k: [] for k in ("p", "R", "v", "w", "q", "qd", "feet", "contact", "velocity", "requested")}
         lengths, usable, offsets = [], [], []
         self.names, self.files, self.sources = [], [], []
         self.geometry_reports = []
@@ -47,27 +46,30 @@ class FootstepMotion(MotionLib):
             if hi-lo <= margin+2:
                 continue
             path = source/(part["case"]+"_labels.npz")
-            if "fingerprint" in part:
-                stat = path.stat()
-                identity = json.dumps([str(path), stat.st_size, stat.st_mtime_ns, metadata_text,
-                                       CACHE_VERSION, JOINT_NAMES])
-                if hashlib.sha256(identity.encode()).hexdigest()[:24] != part["fingerprint"]:
-                    raise ValueError("Reference data changed since split/checkpoint: "+str(path))
-            manifest = json.loads((source/"manifest.json").read_text())
-            threshold = manifest["force_threshold_N"]
+            if "fingerprint" in part and reference_fingerprint(path, metadata_text) != part["fingerprint"]:
+                raise ValueError("Reference data changed since split/checkpoint: "+str(path))
+            kinematic = part.get("reference_schema") == KINEMATIC_REFERENCE
             with np.load(path, allow_pickle=False) as d:
                 qpos, qvel = d["qpos"][lo:hi], d["qvel"][lo:hi]
                 feet, cmd = d["foot_state"][lo:hi], d["velocity_command"][lo:hi]
+                requested = d["requested"][lo:hi] if reserve_steps and "requested" in d else cmd
                 times = d["sim_time"][lo:hi]
-            if (not all(np.isfinite(x).all() for x in (qpos, qvel, feet, cmd))
+                if kinematic:
+                    contact = d["contact"][lo:hi]
+                    if contact.dtype != np.bool_ or contact.shape != (hi-lo, 2):
+                        raise ValueError("Invalid kinematic contact array in "+str(path))
+                else:
+                    manifest = json.loads((source/"manifest.json").read_text())
+                    contact = (feet[:, :, 13]>0)&(feet[:, :, 9]>=manifest["force_threshold_N"])
+            if (not all(np.isfinite(x).all() for x in (qpos, qvel, feet, cmd, requested))
                     or not np.allclose(np.diff(times), .02, atol=1e-5, rtol=0)):
                 raise ValueError("Missing state/command or irregular time in " + str(path))
             t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
             p, R = t(qpos[:, :3]), quat_to_mat(t(qpos[:, 3:7]))
             v, w = t(qvel[:, :3]), (R@t(qvel[:, 3:6]).unsqueeze(-1)).squeeze(-1)
             q, qd = t(qpos[:, qidx]), t(qvel[:, vidx])
-            data = dict(p=p, R=R, v=v, w=w, q=q, qd=qd, feet=t(feet), velocity=t(cmd),
-                        contact=torch.as_tensor((feet[:, :, 13]>0)&(feet[:, :, 9]>=threshold), device=device))
+            data = dict(p=p, R=R, v=v, w=w, q=q, qd=qd, feet=t(feet), velocity=t(cmd), requested=t(requested),
+                        contact=torch.as_tensor(contact, device=device))
             # Keep measured feet as command targets; report compatibility with the training asset.
             pick = torch.linspace(0, len(p)-1, min(32, len(p)), device=device).long()
             bp, bR = kin.forward(p[pick], R[pick], v[pick], w[pick], q[pick], qd[pick], all_bodies=True)[:2]
@@ -88,6 +90,7 @@ class FootstepMotion(MotionLib):
         self.root_p, self.root_R, self.root_v, self.root_w = (values[k] for k in ("p", "R", "v", "w"))
         self.q, self.qd = values["q"], values["qd"]
         self.feet, self.contact, self.velocity_command = (values[k] for k in ("feet", "contact", "velocity"))
+        self.requested_velocity = values["requested"]
         self.num_frames = cursor
         self.clip_start = torch.tensor(offsets, device=device)
         self.clip_len = torch.tensor(usable, device=device)

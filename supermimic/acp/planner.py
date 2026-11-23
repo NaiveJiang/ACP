@@ -92,7 +92,7 @@ class ContactPlanner(nn.Module):
     One cross-attention layer: its head-averaged weights are the affordances; its output with the context gives
     the occupancy."""
 
-    def __init__(self, prop_dim: int, cfg: PlannerCfg, d: int = 96, heads: int = 32):
+    def __init__(self, prop_dim: int, cfg: PlannerCfg, d: int = 96, heads: int = 32, bodies: int = NB):
         super().__init__()
         self.prop_dim, self.hist = prop_dim, cfg.hist
         self.L, self.W = cfg.scan_x[2], cfg.scan_y[2]
@@ -102,7 +102,7 @@ class ContactPlanner(nn.Module):
         self.ctx = nn.Sequential(nn.Linear(d, 64), nn.ELU(), nn.Linear(64, 64))
         self.shared = nn.Sequential(nn.Linear(prop_dim * cfg.hist + 3 + 64, 128), nn.ReLU(), nn.Linear(128, 128), nn.ReLU(),
                                     nn.Linear(128, d))  # fmt: skip
-        self.body = nn.Parameter(0.1 * torch.randn(NB, d))
+        self.body = nn.Parameter(0.1 * torch.randn(bodies, d))
         self.film = nn.Sequential(nn.Linear(d, 64), nn.ELU(), nn.Linear(64, 2 * d))
         self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
         self.occ = nn.Sequential(nn.Linear(d + 64, 512), nn.ELU(), nn.Linear(512, 512), nn.ELU(), nn.Linear(512, 512), nn.ELU(),
@@ -111,15 +111,21 @@ class ContactPlanner(nn.Module):
 
     def forward(self, prop: torch.Tensor, goal: torch.Tensor, pts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """prop (B, hist, prop_dim), goal (B, 3), pts (B, P, 3) -> log affordances (B, 9, P), occupancy logits (B, 9)."""
+        log_alpha, occ, _ = self.features(prop, goal, pts)
+        return log_alpha, occ
+
+    def features(self, prop, goal, pts):
         B = pts.shape[0]
         g = self.conv(pts[..., 2].reshape(B, 1, self.L, self.W)).flatten(2).transpose(1, 2)  # (B, P, 48)
         kv = self.proj(torch.cat((self.point(pts), g), -1))
-        ctx = self.ctx(kv).max(1).values
+        ctx = self.ctx(kv).max(1).values.expand(len(prop), -1)
+        kv = kv.expand(len(prop), -1, -1)
         h = self.shared(torch.cat((self.prop_norm(prop).flatten(1), goal, ctx), -1))
         scale, shift = self.film(self.body).chunk(2, -1)
         out, w = self.attn(h.unsqueeze(1) * (1 + scale) + shift, kv, kv, need_weights=True, average_attn_weights=True)
-        occ = self.occ(torch.cat((out, ctx.unsqueeze(1).expand(-1, NB, -1)), -1)).squeeze(-1)
-        return torch.log(w.clamp_min(1e-12)), occ
+        features = torch.cat((out, ctx.unsqueeze(1).expand(-1, self.body.shape[0], -1)), -1)
+        occ = self.occ(features).squeeze(-1)
+        return torch.log(w.clamp_min(1e-12)), occ, features
 
 
 def proprio(o: torch.Tensor) -> torch.Tensor:
