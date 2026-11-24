@@ -12,7 +12,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ...rotations import mat_to_quat, quat_to_mat, yaw_mat
-from .motion_matching import Database, FOOT_OFFSET, Robot, heading, local
+from .motion_matching import Database, FOOT_OFFSET, Robot, clip_sampling_weights, heading, local
 
 FORMAT = "roban_motion_codec_v1"
 LATENT_DIM = 32
@@ -188,6 +188,26 @@ def evaluate(reconstruction, codec, ids, batch_size):
     return dict(zip(names, scores.tolist()))
 
 
+def upstream_holdout(db):
+    clips = np.unique(db.clip[db.candidates])
+    # The original clip and its mirror share a split.
+    names = [db.names[i].removesuffix(" mirrored") for i in clips]
+    groups, group_ids = np.unique(names, return_inverse=True)
+    if len(groups) < 2:
+        raise ValueError("Need at least two independent clips in the mapped library")
+    counts = np.bincount(db.clip[db.candidates], minlength=len(db.names))
+    sizes = np.bincount(group_ids, weights=counts[clips])
+    high_step = np.unique(group_ids[db.high_step_clips[clips]])
+    if db.preserve_ground and len(high_step) > 1:
+        # Keep the longer high-step segment for training and hold out the shorter one.
+        chosen = high_step[np.argmin(sizes[high_step])]
+    else:
+        small = np.flatnonzero(sizes <= .25*sizes.sum())
+        choices = small if len(small) else np.arange(len(groups))
+        chosen = choices[np.argmax(sizes[choices])]
+    return clips[group_ids == chosen]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", type=Path, default=Path.home()/"roban数据/lafan1")
@@ -223,20 +243,18 @@ def main():
     if len(clips) < 2:
         parser.error("Use at least two clips with upright motion to hold out a validation clip")
     if args.upstream_roban:
-        # Mirrored copies must stay on the same side of the split.
-        groups = np.array([db.names[i].removesuffix(" mirrored") for i in clips])
-        unique, group_ids = np.unique(groups, return_inverse=True)
-        if len(unique) < 2:
-            parser.error("Need at least two independent clips in the mapped library")
-        counts = np.bincount(db.clip[db.candidates], minlength=len(db.names))
-        group_sizes = np.bincount(group_ids, weights=counts[clips])
-        small_groups = np.flatnonzero(group_sizes <= .25*group_sizes.sum())
-        choices = small_groups if len(small_groups) else np.arange(len(unique))
-        holdout = clips[group_ids == choices[np.argmax(group_sizes[choices])]]
+        try:
+            holdout = upstream_holdout(db)
+        except ValueError as error:
+            parser.error(str(error))
     else:
         holdout = rng.permutation(clips)[:max(1, len(clips)//5)]
     keep = ~np.isin(db.clip[db.candidates], holdout)
     train = torch.as_tensor(db.candidates[keep], device=args.device)
+    sampling = None
+    if db.preserve_ground:
+        sampling = torch.as_tensor(clip_sampling_weights(db.clip[db.candidates[keep]]),
+                                   dtype=torch.float32, device=args.device)
     validation = db.candidates[~keep]
     validation = torch.as_tensor(rng.choice(validation, size=min(args.eval_frames, len(validation)), replace=False),
                                  device=args.device)
@@ -253,7 +271,9 @@ def main():
 
     best = math.inf
     for step in range(1, args.steps+1):
-        ids = train[torch.randint(len(train), (args.batch,), device=args.device)]
+        batch = (torch.randint(len(train), (args.batch,), device=args.device) if sampling is None
+                 else torch.multinomial(sampling, args.batch, replacement=True))
+        ids = train[batch]
         loss, _ = reconstruction(codec, ids)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -268,7 +288,8 @@ def main():
                 best = scores["loss"]
                 torch.save(dict(format=FORMAT, codec=codec.state_dict(), fps=db.fps,
                                 database=db.projection_signature(), clips=db.names, joints=robot.joints,
-                                validation_clips=[db.names[i] for i in holdout], metrics=scores),
+                                validation_clips=[db.names[i] for i in holdout],
+                                balance_clips=db.preserve_ground, metrics=scores),
                            args.out/"model.tmp")
                 (args.out/"model.tmp").replace(args.out/"model.pt")
 

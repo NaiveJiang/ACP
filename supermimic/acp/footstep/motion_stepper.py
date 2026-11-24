@@ -12,7 +12,7 @@ from torch.nn import functional as F
 
 from ...rotations import quat_to_mat
 from .motion_codec import LATENT_DIM, Q, apply_decoded_pose, load_codec
-from .motion_matching import heading, rotate
+from .motion_matching import clip_sampling_weights, heading, rotate
 
 FORMAT = "roban_motion_stepper_v1"
 
@@ -211,10 +211,14 @@ def main():
     feature_dim = len(codec.feature_mean)
     state, frame, clip, train_mask, fps = load_latents(args.codec/"latent.npz", stored, feature_dim, args.device)
     starts = windows(frame, clip, train_mask, args.window)
-    train_start = torch.as_tensor(starts[train_mask[starts]], device=args.device)
+    training = starts[train_mask[starts]]
+    train_start = torch.as_tensor(training, device=args.device)
     val = starts[~train_mask[starts]]
     if not len(val) or not len(train_start):
         parser.error("Need consecutive training and held-out windows at this window length")
+    sampling = None
+    if stored.get("balance_clips"):
+        sampling = torch.as_tensor(clip_sampling_weights(clip[training]), dtype=torch.float32, device=args.device)
     validation = torch.as_tensor(rng.choice(val, size=min(args.eval_frames, len(val)), replace=False),
                                  device=args.device)
     training_states = state[torch.as_tensor(np.flatnonzero(train_mask), device=args.device)]
@@ -234,7 +238,9 @@ def main():
           f"{args.window-1} predicted frames ({(args.window-1)/fps:.2f} s)", flush=True)
     best = math.inf
     for step in range(1, args.steps+1):
-        batch = train_start[torch.randint(len(train_start), (args.batch,), device=args.device)]
+        choice = (torch.randint(len(train_start), (args.batch,), device=args.device) if sampling is None
+                  else torch.multinomial(sampling, args.batch, replacement=True))
+        batch = train_start[choice]
         target = state[batch[:, None]+offsets]
         loss, _ = rollout_loss(model, target, feature_dim)
         optimizer.zero_grad(set_to_none=True)

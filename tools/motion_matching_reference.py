@@ -58,17 +58,47 @@ def interpolate(poses, source_rows, root):
     return output
 
 
-def build_reference(database, csv_dir, out, *, add_high_step_run=False):
+def build_reference(database, csv_dir, out, *, add_high_step_run=False, frax_dir=None):
     starts, stops, human_contacts = read_database_index(database)
     robot = Robot()
     mirror = Mirror(robot)
     geometry = ReferenceGeometry(robot)
+    if frax_dir is not None:
+        source_manifest = json.loads((frax_dir/"manifest.json").read_text())
+        if (source_manifest.get("schema") != "roban_lafan1_frax_reference"
+                or source_manifest.get("robot") != "biped_s17_ver"
+                or source_manifest.get("fps") != CSV_FPS
+                or source_manifest.get("source_start_frame", 0) != 0):
+            raise ValueError("Expected full-length Frax S17-ver LaFAN1 references at 30 Hz")
+        catalogue = {Path(clip["clip"]).name.removesuffix("_motion.npz"): frax_dir/clip["clip"]
+                     for clip in source_manifest["clips"]}
+        columns = np.r_[np.arange(robot.root, robot.root+7), robot.joint_qpos]
+
+    def load_take(source, stop):
+        if frax_dir is None:
+            path = csv_dir/(source+".csv")
+            poses = robot.load(path, CSV_FPS)
+        else:
+            if source not in catalogue:
+                raise ValueError(f"Missing Frax take {source} in {frax_dir}")
+            path = catalogue[source]
+            with np.load(path, allow_pickle=False) as data:
+                values = data["joint_pos"]
+                if (data["robot_id"].item() != "roban" or float(data["fps"]) != CSV_FPS
+                        or list(data["joint_names"]) != list(robot.joints)
+                        or values.ndim != 2 or values.shape[1] != len(columns) or not np.isfinite(values).all()
+                        or not np.allclose(np.linalg.norm(values[:, 3:7], axis=1), 1., atol=1e-3)):
+                    raise ValueError(f"Invalid Frax S17 pose archive: {path}")
+            poses = np.broadcast_to(robot.model.qpos0, (len(values), robot.model.nq)).copy()
+            poses[:, columns] = values
+        if stop > len(poses):
+            raise ValueError(f"{path.name} does not cover required source row {stop-1}")
+        return poses
+
     clips = []
     for take in (0, 2, 1):  # Preview order: idle, walk, run.
         gait, source, start, stop = TAKES[take]
-        raw = robot.load(csv_dir/(source+".csv"), CSV_FPS)
-        if stop > len(raw):
-            raise ValueError(f"{source}.csv does not cover the original range [{start}, {stop})")
+        raw = load_take(source, stop)
         for mirrored in (False, True):
             index = 2*take+mirrored
             db_start, db_stop = int(starts[index]), int(stops[index])
@@ -93,10 +123,8 @@ def build_reference(database, csv_dir, out, *, add_high_step_run=False):
 
     if add_high_step_run:
         source = HIGH_STEP_SOURCE
-        raw = robot.load(csv_dir/(source+".csv"), CSV_FPS)
+        raw = load_take(source, max(stop for _, stop in HIGH_STEP_RANGES))
         for start, stop in HIGH_STEP_RANGES:
-            if stop > len(raw):
-                raise ValueError(f"{source}.csv does not cover the high-step range [{start}, {stop})")
             # Supplementary clips follow main's timing; the original six retain the demo's retiming.
             frames = (stop-start-1)*DATABASE_FPS//CSV_FPS + 1
             source_rows = np.linspace(start, stop-1, frames)
@@ -118,9 +146,10 @@ def build_reference(database, csv_dir, out, *, add_high_step_run=False):
     out.mkdir(parents=True, exist_ok=False)
     reference.mkdir()
     (out/"metadata.json").write_text(json.dumps(dict(sample_hz=DATABASE_FPS, source_hz=CSV_FPS), indent=2)+"\n")
+    source = (dict(retargeter="frax", robot="biped_s17_ver", motion_dir=str(frax_dir.resolve()))
+              if frax_dir is not None else dict(csv_dir=str(csv_dir.resolve())))
     manifest = dict(schema="roban_motion_matching_preview", status="preview",
-                    database=str(database.resolve()), csv_dir=str(csv_dir.resolve()),
-                    clips=[clip for clip, _, _ in clips])
+                    database=str(database.resolve()), **source, clips=[clip for clip, _, _ in clips])
     (reference/"manifest.json").write_text(json.dumps(manifest, indent=2)+"\n")
     for clip, poses, source_rows in clips:
         np.savez_compressed(reference/(clip["case"]+"_labels.npz"), qpos=poses, source_row=source_rows)
@@ -151,14 +180,17 @@ def write_native_catalogue(preview, out):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database", type=Path, default=Path.home()/"Motion-Matching-main/resources/database.bin")
-    parser.add_argument("--csv-dir", type=Path, default=Path.home()/"roban数据/lafan1")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--csv-dir", type=Path, default=Path.home()/"roban数据/lafan1")
+    source.add_argument("--frax-data", type=Path, help="ACP dataset exported by Frax for biped_s17_ver")
     parser.add_argument("--add-high-step-run", action="store_true",
                         help="Include the two validated run2_subject4 ranges and their mirrors")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.out.exists():
         parser.error(f"{args.out} already exists")
-    build_reference(args.database, args.csv_dir, args.out, add_high_step_run=args.add_high_step_run)
+    build_reference(args.database, args.csv_dir, args.out, add_high_step_run=args.add_high_step_run,
+                    frax_dir=args.frax_data)
 
 
 if __name__ == "__main__":

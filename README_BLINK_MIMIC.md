@@ -254,3 +254,19 @@ ACP_ROBOT=roban "$py" -m supermimic.acp.footstep.reference_planner \
 ```
 
 `forecast.npz` 含 20、100、200、400、600、1000 ms 的参考。把 `ReferenceWindow.components()` 的六类数组加上 batch 维度，交给 `ReferenceTask.command_from_reference()`，再用跟踪器生成 21 个关节指令。
+
+## Frax S17 数据与方案 1
+
+在 Frax 仓库用 `examples/ik/lafan1/retarget_s17.py` 导出 `data/roban_lafan1_frax_s17_001`。该工具读取原始 LaFAN1 BVH 和 `biped_s17_ver` 的 URDF 与 MJCF。将动作目录放在 ACP 根目录下，用下面的命令按原版 Motion Matching 的选段与时序生成 60 Hz 参考库。指定新的输出目录即可保留已有参考库。
+
+```bash
+export ACP_ROBAN_DESCRIPTION="$HOME/kuavo_amp_mjlab/src/mjlab/asset_zoo/robots/biped_s17_ver"
+ACP_ROBOT=roban .venv_footstep/bin/python -m tools.motion_matching_reference \
+  --database "$HOME/Motion-Matching-main/resources/database.bin" \
+  --frax-data data/roban_lafan1_frax_s17_001 --add-high-step-run \
+  --out logs/motion_matching_upstream_roban_frax_001
+
+bash run_lmm_frax.sh --check-only
+```
+
+全身跟踪器训练完成后，执行 `bash run_lmm_frax.sh`。脚本依次训练编解码器、Stepper 和 Projector，最终将三组推理权重保存到 `logs/roban_lmm_frax_s17_001/model/`。使用不同的参考库位置时传入 `--upstream-roban DIRECTORY`，开始新一轮训练时用 `--out NEW_DIRECTORY` 指定输出。

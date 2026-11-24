@@ -82,14 +82,23 @@ PY
     fi
 
     cat > "$build_dir/gamepads.txt" <<'MAPPINGS'
+03000000bc2000007e50000011010000,BEITONG A1N3 BFM GAMEPAD,a:b0,b:b1,x:b3,y:b4,back:b10,guide:b12,start:b11,leftstick:b13,rightstick:b14,leftshoulder:b6,rightshoulder:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a5,righttrigger:a4,platform:Linux,
 030003e5bc2000007e50000011010000,BEITONG A1N3 BFM GAMEPAD,a:b0,b:b1,x:b3,y:b4,back:b10,guide:b12,start:b11,leftstick:b13,rightstick:b14,leftshoulder:b6,rightshoulder:b7,dpup:h0.1,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,leftx:a0,lefty:a1,rightx:a2,righty:a3,lefttrigger:a5,righttrigger:a4,platform:Linux,
 MAPPINGS
     "${CXX:-g++}" -std=c++17 -O3 -Wno-unused-result -I"$mujoco_dir/include" \
         "$SOURCE/s17_controller.cpp" "${mujoco_libraries[0]}" -Wl,-rpath,"$mujoco_dir" -lglfw \
         -o "$build_dir/controller"
+
+    # The standalone GLFW player detects gamepads automatically.
+    native_args=()
+    for option in "$@"; do
+        if [[ "$option" != --gamepad ]]; then
+            native_args+=("$option")
+        fi
+    done
     cd "$SOURCE"
     "$build_dir/controller" --motion-dir "$HOME/roban数据/lafan1" --scene "$build_dir/scene.xml" \
-        --gamepad-db "$build_dir/gamepads.txt" "${prepared_args[@]}" "$@"
+        --gamepad-db "$build_dir/gamepads.txt" "${prepared_args[@]}" "${native_args[@]}"
 else
     exec "$PYTHON" -m supermimic.acp.footstep.motion_matching "$@"
 fi

@@ -207,12 +207,22 @@ def intent_mode(command):
 INTENT_MODES = np.stack((INTENT_SCALE, TURN_INTENT_SCALE, PIVOT_INTENT_SCALE))
 
 
-def upstream_clips(directory):
+def upstream_manifest(directory):
     reference = directory/"reference"
     manifest = json.loads((reference/"manifest.json").read_text())
     if manifest.get("schema") != "roban_motion_matching_preview":
         raise ValueError(f"Expected a mapped Motion Matching library at {directory}")
-    return manifest["clips"]
+    return manifest
+
+
+def upstream_clips(directory):
+    return upstream_manifest(directory)["clips"]
+
+
+def clip_sampling_weights(clip_ids):
+    """Mix frame-uniform and clip-uniform sampling for unequal clip lengths."""
+    _, inverse, counts = np.unique(clip_ids, return_inverse=True, return_counts=True)
+    return .5/len(clip_ids) + .5/(len(counts)*counts[inverse])
 
 
 def read_upstream_poses(robot, directory):
@@ -244,14 +254,24 @@ class Database:
         self._build(robot, fps, ((p.stem, robot.load(p, fps)) for p in paths), smooth=True)
 
     @classmethod
-    def from_upstream_preview(cls, robot, directory, fps, *, high_step_running=True):
-        clips = upstream_clips(directory)
+    def from_upstream_preview(cls, robot, directory, fps, *, high_step_running=True, case=None):
+        manifest = upstream_manifest(directory)
+        metadata = json.loads((directory/"metadata.json").read_text())
+        if metadata["sample_hz"] != fps:
+            raise ValueError(f"Upstream library is {metadata['sample_hz']} Hz, expected {fps:g} Hz")
+        clips = manifest["clips"]
+        if case is not None:
+            selected = [clip for clip in clips if clip["case"] == case]
+            if not selected:
+                available = ", ".join(clip["case"] for clip in clips)
+                raise ValueError(f"Unknown upstream clip {case!r}. Available clips: {available}")
+            clips = selected
         db = cls.__new__(cls)
-        db._build(robot, fps, read_upstream_tracks(robot, directory/"reference", clips), smooth=False)
+        db._build(robot, fps, read_upstream_tracks(robot, directory/"reference", clips), smooth=False,
+                  preserve_ground=manifest.get("retargeter") == "frax")
+        db.high_step_clips = np.array([clip.get("purpose") == "high_step_run" for clip in clips])
         if high_step_running:
-            high_step = np.array([clip.get("purpose") == "high_step_run" for clip in clips])
-            db.high_step_clips = high_step
-            db.running_frames = db.candidates[high_step[db.clip[db.candidates]]]
+            db.running_frames = db.candidates[db.high_step_clips[db.clip[db.candidates]]]
             if len(db.running_frames):
                 weights = (.75, .75, 1., 1., 1., 1., 1.5)
                 stops = (0, 3, 6, 9, 12, 15, 21, 27)
@@ -261,10 +281,11 @@ class Database:
                 db.running_features = db.features[db.running_frames]*db.running_scale
         return db
 
-    def _build(self, robot, fps, tracks, *, smooth):
+    def _build(self, robot, fps, tracks, *, smooth, preserve_ground=False):
         steps = np.rint(LOOKAHEAD * fps).astype(int)
         self.names = []
         self.fps = float(fps)
+        self.preserve_ground = preserve_ground
         self.projector = None
         self.running_frames = np.empty(0, dtype=int)
         self.ignore_neighbor = max(1, round(.40*fps))
@@ -288,8 +309,12 @@ class Database:
             # poses. Calibrate ground and match clips using upright locomotion only.
             upright_frames = (upright > .82) & (clearance > .59) & (clearance < .87)
             ground = np.median(lowest_foot[upright_frames]) if upright_frames.any() else 0.
-            root[:, 2] -= ground
-            feet[..., 2] -= ground
+            if not preserve_ground:
+                root[:, 2] -= ground
+                feet[..., 2] -= ground
+            # Use the foot-center calibration only for contact heuristics on Frax input.
+            # Its root height is already aligned to the S17 collision mesh floor.
+            contact_feet = feet - np.array([0., 0., ground]) if preserve_ground else feet
             good = upright_frames & (lowest_foot-ground > -.045) & (lowest_foot-ground < .085)
             yaw = heading(root[:, 3:7])
             ids = np.arange(len(pose))
@@ -299,7 +324,7 @@ class Database:
             root_velocity = local(np.gradient(root[:, :3], axis=0)*fps, yaw)
             foot_velocity = local(np.gradient(feet, axis=0)*fps, yaw[:, None])
             foot_position = local(feet-root[:, None, :3], yaw[:, None])
-            contacts.append(planted(feet, foot_velocity))
+            contacts.append(planted(contact_feet, foot_velocity))
             trajectory = rotate(root[future, :2]-root[:, None, :2], -yaw[:, None])
             direction = planar_heading(yaw[future]-yaw[:, None])
             feature = np.column_stack((foot_position.reshape(-1, 6), foot_velocity.reshape(-1, 6),
@@ -308,7 +333,7 @@ class Database:
             still = (usable & (np.linalg.norm(trajectory, axis=-1).max(axis=-1) < .045)
                      & (np.abs(direction[..., 1]).max(axis=-1) < .15)
                      & (np.linalg.norm(foot_velocity, axis=-1).max(axis=-1) < .20)
-                     & (feet[..., 2].max(axis=-1) < .065) & (direction[..., 0].min(axis=-1) > 0.))
+                     & (contact_feet[..., 2].max(axis=-1) < .065) & (direction[..., 0].min(axis=-1) > 0.))
             poses.append(pose)
             features.append(feature)
             soon = np.minimum(ids + look, len(pose)-1)
@@ -353,6 +378,8 @@ class Database:
         digest = hashlib.sha256()
         for array in (self.projection_keys(), self.candidates, self.clip[self.candidates], INTENT_MODES):
             digest.update(np.ascontiguousarray(array).tobytes())
+        if self.preserve_ground:
+            digest.update(np.ascontiguousarray(self.pose).tobytes())
         digest.update(repr((self.names, self.fps, self.ignore_neighbor)).encode())
         return digest.hexdigest()
 

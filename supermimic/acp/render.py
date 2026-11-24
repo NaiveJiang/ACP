@@ -25,9 +25,10 @@ TARGET_RGBA = [(0.9, 0.2, 0.2, 0.9), (0.2, 0.4, 0.95, 0.9), (1.0, 0.55, 0.1, 0.9
                (0.2, 0.8, 0.3, 0.9), (0.6, 0.3, 0.8, 0.9), (0.6, 0.3, 0.8, 0.9), (0.95, 0.85, 0.2, 0.9)]  # fmt: skip
 
 
-def scene_xml(boxes: np.ndarray) -> str:
+def scene_xml(boxes: np.ndarray, *, primitive_soles: bool = False) -> str:
     """The selected robot, a ghost copy (prefix ``ref_``), a floor and boxes (K, 9)."""
-    root = ET.fromstring(get_spec().to_xml())
+    spec = get_spec(primitive_soles=True) if primitive_soles else get_spec()
+    root = ET.fromstring(spec.to_xml())
     compiler = root.find("compiler")
     if compiler is not None:
         meshdir = compiler.get("meshdir", ".")

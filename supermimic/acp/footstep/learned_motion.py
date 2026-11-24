@@ -13,7 +13,7 @@ from torch.nn import functional as F
 
 from .motion_codec import Q, load_codec
 from .motion_matching import (Database, POSTURE_WEIGHT, Robot, STANCE_WEIGHT,
-                              command_trajectory, intent_mode, rotate)
+                              clip_sampling_weights, command_trajectory, intent_mode, rotate)
 from .motion_stepper import load_latents, load_stepper
 
 
@@ -146,7 +146,8 @@ def checksum(path):
 def training_pairs(db, state, rows, candidate_frames, bank_mask, rng, count, device):
     from .motion_projector import teach
 
-    frames = rng.choice(candidate_frames, size=count, replace=True)
+    sampling = clip_sampling_weights(db.clip[candidate_frames]) if db.preserve_ground else None
+    frames = rng.choice(candidate_frames, size=count, replace=True, p=sampling)
     command = db.intent[frames].copy()
     command += rng.normal(size=command.shape)*[.18, .13, .25]
     change = rng.random(count)

@@ -114,9 +114,15 @@ class ReferenceGeometry:
             kinds = model.geom_type[active]
             box = kinds == mujoco.mjtGeom.mjGEOM_BOX
             cylinder = kinds == mujoco.mjtGeom.mjGEOM_CYLINDER
-            if not np.all(box | cylinder):
+            mesh = kinds == mujoco.mjtGeom.mjGEOM_MESH
+            if not np.all(box | cylinder | mesh):
                 raise ValueError("Unsupported RoBan foot collision shape")
-            self.geoms.append((active, box, model.geom_size[active]))
+            vertices = {}
+            for index in np.flatnonzero(mesh):
+                mesh_id = model.geom_dataid[active[index]]
+                start = model.mesh_vertadr[mesh_id]
+                vertices[index] = model.mesh_vert[start:start+model.mesh_vertnum[mesh_id]]
+            self.geoms.append((active, box, model.geom_size[active], vertices))
 
     def measure(self, pose):
         robot = self.robot
@@ -128,10 +134,13 @@ class ReferenceGeometry:
             mujoco.mj_kinematics(model, data)
             feet[i, :, :3] = robot.foot_positions()
             feet[i, :, 3:] = data.xquat[robot.feet]
-            for j, (geom, box, size) in enumerate(self.geoms):
-                world_z = np.abs(data.geom_xmat[geom].reshape(-1, 3, 3)[:, 2])
-                extension = np.where(box, (world_z*size).sum(-1),
-                                     world_z[:, 2]*size[:, 1]+np.sqrt(np.maximum(0., 1.-world_z[:, 2]**2))*size[:, 0])
+            for j, (geom, box, size, vertices) in enumerate(self.geoms):
+                world_z = data.geom_xmat[geom].reshape(-1, 3, 3)[:, 2]
+                axis_z = np.abs(world_z)
+                extension = np.where(box, (axis_z*size).sum(-1),
+                                     axis_z[:, 2]*size[:, 1]+np.sqrt(np.maximum(0., 1.-axis_z[:, 2]**2))*size[:, 0])
+                for index, vertex in vertices.items():
+                    extension[index] = -np.min(vertex@world_z[index])
                 gap[i, j] = (data.geom_xpos[geom, 2]-extension).min()
         return feet, gap
 

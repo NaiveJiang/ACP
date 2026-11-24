@@ -16,10 +16,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt", type=str, required=True)
-parser.add_argument("--motion-dir", help="Reference motions to evaluate instead of the checkpoint's motion directory")
+reference_source = parser.add_mutually_exclusive_group()
+reference_source.add_argument("--motion-dir", help="Reference motions to evaluate instead of the checkpoint's motion directory")
+reference_source.add_argument("--upstream-roban", type=Path, help="Mapped upstream Motion Matching library")
+parser.add_argument("--clip", help="One clip, such as walk/walk for --motion-dir or walk for --upstream-roban")
+parser.add_argument("--start-seconds", type=float, default=0., help="Start inside the selected upstream clip")
+parser.add_argument("--viewer", action="store_true", help="Play a clip or the entire upstream library in a live MuJoCo window")
 parser.add_argument("--ema", action="store_true", help="Evaluate the saved EMA policy")
 parser.add_argument("--ground-friction", type=float, default=None)
 parser.add_argument("--box-friction", type=float, default=None)
@@ -34,6 +42,12 @@ parser.add_argument("--train_noise", nargs="*", default=None, choices=["obs", "c
                          " actions (0.1)")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
+if args.viewer and not (args.clip or args.upstream_roban):
+    parser.error("--viewer requires --clip or --upstream-roban")
+if not math.isfinite(args.start_seconds) or args.start_seconds < 0 or (
+    args.start_seconds and not (args.upstream_roban and args.clip)
+):
+    parser.error("--start-seconds must be nonnegative and requires one upstream clip")
 _noise = set() if args.train_noise is None else set(args.train_noise or ("obs", "command", "action"))
 NOISE_OBS, NOISE_CMD, NOISE_ACT = "obs" in _noise, "command" in _noise, "action" in _noise
 
@@ -62,7 +76,49 @@ a_ = ck["args"]
 ia = ck.get("init_args", a_)
 motion_dir = args.motion_dir or ia.get("motion_dir") or MOTION_DIR
 kin = RobotKinematics(dev)
-motion = MotionLib.from_dir(motion_dir, kin, dev)
+if (args.clip or args.upstream_roban) and ck.get("task_interface") != "reference_mimic_v1":
+    parser.error("--clip and --upstream-roban require a full-body reference checkpoint")
+if args.upstream_roban:
+    from supermimic.acp.footstep.motion_matching import Database, Robot, upstream_clips
+
+    if ROBOT_ID != "roban":
+        parser.error("--upstream-roban requires ACP_ROBOT=roban")
+    directory = args.upstream_roban
+    robot = Robot()
+    try:
+        sample_hz = float(json.loads((directory/"metadata.json").read_text())["sample_hz"])
+        if not math.isfinite(sample_hz) or sample_hz <= 0:
+            raise ValueError("The upstream sample rate must be positive and finite")
+        database = Database.from_upstream_preview(robot, directory, sample_hz, case=args.clip,
+                                                  high_step_running=False)
+    except (KeyError, OSError, ValueError) as error:
+        parser.error(str(error))
+    cases = [args.clip] if args.clip else [clip["case"] for clip in upstream_clips(directory)]
+    columns = np.r_[np.arange(robot.root, robot.root+7), robot.joint_qpos]
+    with TemporaryDirectory(prefix="roban-upstream-") as temp:
+        paths = []
+        for index, case in enumerate(cases):
+            poses = database.pose[database.clip == index]
+            if args.start_seconds > (len(poses)-1)/sample_hz-CONTROL_DT:
+                parser.error(f"--start-seconds leaves less than one control step in {case!r}")
+            start = int(args.start_seconds*sample_hz)
+            path = Path(temp)/f"{case}_motion.npz"
+            np.savez(path, joint_pos=poses[start:, columns].astype(np.float32),
+                     joint_names=np.array(robot.joints), robot_id=np.array(ROBOT_ID), fps=np.float32(sample_hz))
+            np.save(Path(temp)/f"{case}_terrain.npy", np.empty((0, 1, 10), dtype=np.float32))
+            paths.append(str(path))
+        motion = MotionLib(paths, kin, dev, root=temp)
+elif args.clip:
+    from supermimic.acp.robot import MOTION_GLOB
+
+    directory = Path(motion_dir)
+    files = {str(file.relative_to(directory)).removesuffix("_motion.npz"): file
+             for file in directory.glob(MOTION_GLOB)}
+    if args.clip not in files:
+        parser.error(f"Unknown clip {args.clip!r} in {directory}. Available clips: {', '.join(sorted(files))}")
+    motion = MotionLib([str(files[args.clip])], kin, dev, root=str(directory))
+else:
+    motion = MotionLib.from_dir(motion_dir, kin, dev)
 term_win = a_.get("term_window", 0.0) if args.term_window is None else args.term_window
 delay_steps = DELAY_STEPS if a_.get("s17_actuators") else 0
 ground_friction, box_friction = evaluation_surface_friction(
@@ -98,19 +154,27 @@ if args.planner:
     planner.eval()
 
 C = len(motion.names)
-FOLDERS = sorted({n.split("/")[0] for n in motion.names})
-folder_of = torch.tensor([FOLDERS.index(n.split("/")[0]) for n in motion.names], device=dev)
-env = TrackingSim(C, motion, mdp, dev, eval_mode=True, reference_reset_action=reference_task,
+env = TrackingSim(1 if args.viewer else C, motion, mdp, dev, eval_mode=True, reference_reset_action=reference_task,
                   ground_friction_range=(ground_friction,) * 2 if friction_override else None,
                   box_friction_range=(box_friction,) * 2 if friction_override else None,
                   primitive_soles=a_.get("primitive_soles", False))
 
 
 @torch.no_grad()
-def evaluate() -> dict:
+def evaluate(viewer=None, clips=None, record_path=None) -> dict | None:
+    if clips is None:
+        clips = list(range(len(motion.names)))
+    names = [motion.names[index] for index in clips]
+    folders = sorted({name.split("/")[0] for name in names})
+    folder_of = torch.tensor([folders.index(name.split("/")[0]) for name in names], device=dev)
+    C = len(clips)
     ids = torch.arange(C, device=dev)
-    env.reset(ids, motion.clip_start.clone())
-    clip_end = motion.clip_end
+    env.done_eval.zero_()
+    env.failed_eval.zero_()
+    clip_start = motion.clip_start[clips]
+    clip_end = motion.clip_end[clips]
+    clip_len = motion.clip_len[clips]
+    env.reset(ids, clip_start)
     gs = torch.full((C,), int(round(args.goal_s / CONTROL_DT)), device=dev)
     ret = torch.zeros(C, device=dev)
     overlap_peak = torch.zeros(C, device=dev)
@@ -124,6 +188,8 @@ def evaluate() -> dict:
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": [], "tgt_w": [], "tgt_valid": []}
     while not bool(env.done_eval.all()):
         S = env.state()
+        if viewer is not None and not viewer.show(S, env.f):
+            return None
         o = env.observe()
         if NOISE_OBS:
             o = mdp.add_noise(o)
@@ -141,7 +207,7 @@ def evaluate() -> dict:
                ctc.command(S, env.f, env.v, gs, noise=NOISE_CMD, targets_w=tw, valid=tv))
         alive = ~env.done_eval.clone()
         tw_win, tv_win = torch.cat((tw_win[1:], tw[None])), torch.cat((tv_win[1:], tv[None]))
-        if args.record:
+        if record_path:
             traj["root_p"].append(S[0].cpu()), traj["root_quat"].append(mat_to_quat(S[1]).cpu())
             traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
             traj["tgt_w"].append(tw.cpu()), traj["tgt_valid"].append(tv.cpu())
@@ -171,14 +237,29 @@ def evaluate() -> dict:
         # otherwise exceed Warp's per-pair contact limit while other clips run.
         finished = (alive & env.done_eval).nonzero(as_tuple=False).flatten()
         env.park_finished_terrains(finished)
-    if args.record:
-        np.savez_compressed(args.record, robot_id=np.array(ROBOT_ID), joint_names=np.array(JOINT_NAMES), names=np.array(motion.names), variant=env.v.cpu().numpy(),
+    if viewer is not None:
+        failed = bool(env.failed_eval[0])
+        if failed and not bool(out["valid"][0]):
+            S1 = S
+        follow_reference = bool(failed and args.upstream_roban)
+        if not viewer.show(S1, f1, follow_reference=follow_reference):
+            return None
+        if follow_reference:
+            print(f"{names[0]}: tracking terminated at {int(f1[0]-clip_start[0])*CONTROL_DT:.2f} s. "
+                  "Continuing the reference to the end.", flush=True)
+            remaining = torch.arange(int(f1[0])+1, int(clip_end[0])+1, device=dev)
+            for frame in remaining.split(1):
+                if not viewer.show(S1, frame, follow_reference=True):
+                    return None
+        print(f"{names[0]}: {'tracking terminated' if failed else 'tracking completed'}.", flush=True)
+    if record_path:
+        np.savez_compressed(record_path, robot_id=np.array(ROBOT_ID), joint_names=np.array(JOINT_NAMES), names=np.array(names), variant=env.v.cpu().numpy(),
                             failed=env.failed_eval.cpu().numpy(),
-                            boxes=motion.clip_boxes[torch.arange(C, device=dev), env.v].cpu().numpy(),
+                            boxes=motion.clip_boxes[clips, env.v].cpu().numpy(),
                             **{k: torch.stack(v).numpy() for k, v in traj.items()}, ref_root_p=motion.root_p.cpu().numpy(),
                             ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
-                            clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
-    norm = ret / ((motion.clip_len - 1).float() * MAX_STEP_REWARD)
+                            clip_start=clip_start.cpu().numpy(), clip_len=clip_len.cpu().numpy())  # fmt: skip
+    norm = ret / ((clip_len - 1).float() * MAX_STEP_REWARD)
     place = torch.stack(place).flatten(0, 1) if place else torch.empty(0, NB, device=dev)
     pl = [place[:, b][~place[:, b].isnan()] for b in range(NB)]
     rnd = lambda x: round(x.item(), 3)  # noqa: E731
@@ -191,7 +272,7 @@ def evaluate() -> dict:
         **({"self_overlap": [
             {"clip": name, "max_m": float(peak), "frames_over_1mm": int(count)}
             for name, peak, count in zip(
-                motion.names, overlap_peak.tolist(), overlap_count.tolist(), strict=True
+                names, overlap_peak.tolist(), overlap_count.tolist(), strict=True
             )
         ]} if mdp.self_collision_penalty is not None else {}),
         "surface_friction": {"ground": ground_friction, "box": box_friction},
@@ -201,9 +282,9 @@ def evaluate() -> dict:
         "term_window": term_win,
         "norm_return": round(norm.mean().item(), 4),
         "n_failed": int(failed.sum().item()),
-        "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
+        "failed": [names[i] for i in failed.nonzero().flatten().tolist()],
         "per_folder": {g: {"norm_return": round(norm[folder_of == i].mean().item(), 4), "fail_rate": round(failed[folder_of == i].mean().item(), 3)}
-                       for i, g in enumerate(FOLDERS)},  # fmt: skip
+                       for i, g in enumerate(folders)},  # fmt: skip
         "contacts": {n: {"precision": round((tp[b] / n_touch[b]).item(), 3) if n_touch[b] > 0 else None,
                          "recall": round((tp[b] / n_label[b]).item(), 3) if n_label[b] > 0 else None,
                          "label_frames": int(n_label[b].item()), "touch_frames": int(n_touch[b].item()),
@@ -214,10 +295,40 @@ def evaluate() -> dict:
     }
 
 
-res = evaluate()
+if args.viewer:
+    from supermimic.acp.reference_viewer import ReferenceViewer
+
+    variant = motion.first_variants(motion.clip_id[motion.clip_start])
+    results = []
+    with ReferenceViewer(motion, motion.boxes(motion.clip_start, variant)[0].cpu().numpy(),
+                         primitive_soles=env.primitive_soles) as viewer:
+        for index, name in enumerate(motion.names):
+            seconds = (int(motion.clip_len[index])-1)*CONTROL_DT
+            print(f"[{index+1}/{C}] Playing {name} for {seconds:.2f} s of reference.", flush=True)
+            record = args.record
+            if record and C > 1:
+                path = Path(record)
+                record = path.with_name(f"{path.stem}_{name}.npz")
+            result = evaluate(viewer, [index], record_path=record)
+            if result is None:
+                raise SystemExit(0)
+            results.append(result)
+        print("Playback finished. Close the viewer to finish.", flush=True)
+        viewer.wait_until_closed()
+    res = results[0]
+    if C > 1:
+        res = {**res, "norm_return": round(sum(r["norm_return"] for r in results)/C, 4),
+               "n_failed": sum(r["n_failed"] for r in results),
+               "failed": [name for r in results for name in r["failed"]],
+               "per_folder": {name: stats for r in results for name, stats in r["per_folder"].items()}}
+        if "self_overlap" in res:
+            res["self_overlap"] = [item for r in results for item in r["self_overlap"]]
+else:
+    res = evaluate(record_path=args.record)
 print(json.dumps({k: v for k, v in res.items() if k != "failed"}, indent=1))
 print(f"failed {res['n_failed']}/{C}: {res['failed'][:10]}{' ...' if res['n_failed'] > 10 else ''}")
-tag = res["interface"] + ("" if args.eta_obs == 1 or not args.planner else f"_eta{args.eta_obs:g}") + (f"_tw{term_win:g}" if term_win else "")
-out = args.out or args.ckpt.replace(".pt", f"_eval_{tag}.json")
-json.dump(res, open(out, "w"), indent=1)
-print("wrote", out)
+if args.out or not args.viewer:
+    tag = res["interface"] + ("" if args.eta_obs == 1 or not args.planner else f"_eta{args.eta_obs:g}") + (f"_tw{term_win:g}" if term_win else "")
+    out = args.out or args.ckpt.replace(".pt", f"_eval_{tag}.json")
+    json.dump(res, open(out, "w"), indent=1)
+    print("wrote", out)
