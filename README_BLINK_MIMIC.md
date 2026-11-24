@@ -270,3 +270,194 @@ bash run_lmm_frax.sh --check-only
 ```
 
 全身跟踪器训练完成后，执行 `bash run_lmm_frax.sh`。脚本依次训练编解码器、Stepper 和 Projector，最终将三组推理权重保存到 `logs/roban_lmm_frax_s17_001/model/`。使用不同的参考库位置时传入 `--upstream-roban DIRECTORY`，开始新一轮训练时用 `--out NEW_DIRECTORY` 指定输出。
+
+训练好 LMM 后，运行 `bash play_lmm_tracker.sh --gamepad`，在 MuJoCo 中
+用手柄输入实时生成参考，再让全身跟踪器闭环执行。默认使用上述 LMM
+和 `logs/roban_lafan1_frax_s17_mimic_002/last.pt` 的 EMA，可用
+`--lmm` 和 `--checkpoint` 覆盖路径。手柄沿用 C++ 检索播放器的输入
+规则，左摇杆指定移动方向和速度，右摇杆指定航向，LT 锁航向后允许
+后退或侧移，A 慢走，Start 重置，RT 配合右摇杆转镜头，空格暂停。
+后拉时立即更新目标朝向，移动速度幅值随左摇杆保持。LMM 按新航向
+的平滑预测轨迹生成动作，仿真跟踪器通过六个未来参考时刻执行。
+
+#### 方案 1 联合续训
+
+在平地手柄控制中先训练局部根参考的全身跟踪器。每个窗口的未来根部
+XY 和 yaw 都相对 LMM 或数据轨迹的当前帧编码。姿态、速度和机身离地
+高度奖励在同一局部接口下计算，累计世界 XY 和 yaw 偏差不会拉回原轨迹。
+原有 reference checkpoint 保留其训练设置。实时播放器可显式传入
+`--root-reference local` 或 `--root-reference world` 做诊断。
+
+```bash
+export ACP_ROBAN_DESCRIPTION="$HOME/kuavo_amp_mjlab/src/mjlab/asset_zoo/robots/biped_s17_ver"
+bash run_lafan_mimic.sh \
+  --reference_root local \
+  --motion_dir data/roban_lafan1_frax_s17_001 \
+  --log_dir logs/roban_lafan1_frax_s17_local_001
+```
+
+使用已训练的 LMM 和全身跟踪器作为初始权重。MuJoCo 闭环执行与手柄播放
+共用方向映射及六个未来参考时刻。PPO 更新 Projector 和全身跟踪器，冻结
+Codec 和 Stepper。Projector 的探索只加在实际采用的重投影上，前视预测
+本身采用确定性推理。速度和航向误差以指令为目标，全身跟踪奖励用 LMM
+参考计算，并对倒地扣分。两个训练模块都有初始策略约束。
+
+```bash
+bash run_joint_lmm.sh \
+  --checkpoint logs/roban_lafan1_frax_s17_local_001/last.pt \
+  --out logs/roban_lmm_joint_local_001 --iterations 120
+```
+
+默认每轮采 4 个最长 6 秒的回合，覆盖起停、变速、转向和掉头。验证使用
+单独的指令序列，每 10 轮比较倒地次数和回报。输出目录的 `last/` 保存
+最新配对权重，`best/` 保存通过该验证选择的权重，`train.jsonl` 记录
+基线和续训结果。全身跟踪器的部署权重使用 EMA。
+
+```bash
+bash play_lmm_tracker.sh --gamepad \
+  --lmm logs/roban_lmm_joint_local_001/best/model \
+  --checkpoint logs/roban_lmm_joint_local_001/best/controller.pt
+```
+
+## Frax upstream 闭环采集与方案 2
+
+全身跟踪器训练完成后，直接指定参考跟踪器的 checkpoint 和新的输出目录。
+
+```bash
+bash collect_frax_upstream.sh \
+  --ckpt logs/roban_lafan1_frax_s17_mimic_002/last.pt \
+  --output data/roban_frax_upstream_contacts_001
+```
+
+默认使用 EMA、零动作噪声及 `logs/motion_matching_upstream_roban_frax_001`。
+可用 `--upstream-roban DIRECTORY` 指定其他 Frax S17 upstream 库。
+默认执行库里的全部站、走、跑及镜像片段。默认把长轨迹分成 8 秒的独立
+episode，每段从本段第一帧重置。内部切段会保留原轨迹的后续参考供 WBC
+前视，实际执行和落足标签仍止于该段末尾。需要按源片段连续执行时用
+`--window-seconds 0`。
+先冒烟运行时可加 `--case run_high_step_5731 --window-seconds 4 --max-clips 1`。
+多个 `--case` 可以同时指定。`--max-steps` 截断的段只用于诊断。
+
+仿真中全身跟踪器使用自己的本体历史和六个未来参考时刻，在一个
+MuJoCo-Warp 世界闭环执行。原始参考从 60 Hz 对齐到控制频率 50 Hz，
+保留 upstream 帧号和 LaFAN1 源行号。每个 20 ms 控制步记录实际状态、
+动作和左右脚脚底中心位姿，接触力取前四个求解子步。默认以平均法向力
+达到 5 N、经消抖后持续至少 5 帧作为承重确认。落足事件取这段承重的
+第一帧，位置使用该帧实测脚底中心，朝向使用脚的世界 yaw。可用
+`--force-threshold` 和 `--min-support-steps` 调整这两个阈值。
+
+输出目录包含以下内容。
+
+| 路径 | 内容 |
+| --- | --- |
+| `references/` | 策略实际使用的 50 Hz Frax 参考及 upstream 来源索引 |
+| `attempts/` | 所有尝试的仿真状态、时间对齐参考、脚底位姿、求解力和原始碰撞记录，含 reset 帧 |
+| `motions/`、`contacts/` | 通过既有动作跟踪验收的物理轨迹和兼容 `ContactTask` 的接触标签 |
+| `samples/` | 通过验收的方案 2 样本，已排除无接触力测量的 reset 帧 |
+| `manifest.json` | checkpoint、来源、每段结果、拒绝原因和可用窗口统计，`completed` 标明是否已处理全部选定尝试 |
+
+每个 `samples/<case>/*.npz` 分片的字段如下。
+
+- `qpos`、`qvel`、`observation`、`previous_action` 是实际状态、WBC 本体观察和上一动作。训练时从同一分片取本体历史。`reference_qpos`、`reference_qvel` 与每一帧一一对齐，可用于动作跟踪或姿态奖励。
+- `sole_pos_w`、`sole_quat_w`、`foot_normal_force_n`、`foot_force_w`、`foot_contact_raw`、`foot_support` 均按左脚、右脚排序。位姿采用世界系和 `wxyz` 四元数，力以 N 为单位。
+- `event_frame`、`event_foot`、`event_pos_w`、`event_yaw_w` 是按时间排序的落足事件表。对第 `t` 帧，用 `lo, hi = future_event_bounds[t]` 取事件表的 `[lo:hi]`，覆盖严格晚于当前帧、距当前帧最多 1.5 秒的全部事件。相对时间是 `(event_frame[lo:hi] - t) * 0.02`。
+- `next_pos_base`、`next_heading_base`、`next_time_s` 提供每只脚的第一个落足目标，基底坐标使用当前实测根位置及仅含 yaw 的坐标轴。朝向编码为 `[sin(yaw), cos(yaw)]`，通过 `next_event_valid` 识别目标是否存在。
+- `sample_valid` 标记有完整 1.5 秒窗口且留足承重确认和消抖余量的帧，训练完整序列时使用该掩码。`next_event_known` 可用于逐脚监督，允许尾部已确认的正样本，同时屏蔽未来未观测到的负样本。
+
+该库没有同步手柄输入，样本没有速度命令字段。若正式采集得不到任何完整
+窗口，命令会以非零状态退出，可从 manifest 查看哪些片段未通过验收。
+
+### 训练方案 2 接触控制器
+
+全身跟踪器采集完成后，把输出目录直接传给独立训练入口。
+
+```bash
+bash run_rollout_contact_tracker.sh \
+  --data data/roban_frax_upstream_contacts_001 \
+  --log-dir logs/roban_frax_contact_controller_001 \
+  --iterations 20000
+```
+
+训练默认采用 WBC 的 BlinkMimic 配置，包括本体历史 10 帧、EMA 和训练期间
+同步更新的世界模型。策略接收本体历史和未来 1.5 秒内全部有序落足事件，
+输出 21 个有界的 PD 关节动作。每个事件槽有 9 个值，依次为有效位、左脚位、
+右脚位、剩余秒数、局部 XYZ 以及相对偏航的正弦和余弦。事件槽数由样本
+最大值确定并保存到 checkpoint，可用 `--event-slots` 增大固定容量。
+`encode_event_plan` 是后续 LMM 接入时应共用的局部坐标编码。
+
+仿真和想象中均按机器人当下根位置和 yaw 编码固定的世界落点。全身走姿奖励
+使用 `motions/` 中的实测 rollout，载入时会与 `samples/` 中的实际状态核对。
+支撑时序、落地位置和朝向也来自同一次 rollout。使用实际支撑标签奖励触地，
+在落地后约 60 ms 内评分落点和偏航，摆动和换重心由局部走姿奖励约束。
+支持双脚腾空，另外惩罚脚滑、过快下落、两腿自碰撞和动作变化。原始 Frax
+全身参考用于对照采集质量。Actor 的输入是本体历史和落足计划。
+
+训练和验证按原始动作分组，同一条动作的切段和镜像都进入同一侧。可用
+多个 `--data` 目录补充不同来源的成功 rollout。采集目录应有 `completed`
+为真的 manifest，且包含足够长的样本和至少两条不同的原始动作。
+
+```bash
+ACP_ROBAN_DESCRIPTION="$HOME/kuavo_amp_mjlab/src/mjlab/asset_zoo/robots/biped_s17_ver" \
+  .venv_footstep/bin/python -m supermimic.acp.footstep.evaluate_tracker \
+  --checkpoint logs/roban_frax_contact_controller_001/last.pt \
+  --out logs/roban_frax_contact_eval_001
+```
+
+当前验证入口在保留的轨迹上计算闭环生存、支撑位置误差和几何接触匹配。
+几何指标用于首轮对比，触地力、时间和脚滑仍需要求解器接触记录评估。
+
+### 方案 2 的 LMM 落足规划器
+
+第一阶段冻结 LMM。训练输入使用实测本体历史和从对应 upstream 潜变量
+自回归展开的 LMM 姿态，监督来自 WBC 实测的双脚承重及落足。预测头逐帧
+预测左右脚支撑与脚底位姿修正，确认承重后输出 1.5 秒内按时间排序的事件。
+位置和朝向标签使用查询时的实测根位置和 yaw。LMM 的姿态只提供相对足底
+运动，新落点以控制器的实际根节点为锚，LMM 世界位置漂移不会加到落点上。
+选定的临近落点会保存在地面坐标中，持续跟踪到落地。
+验证按源动作划分，报告和几何基线相比的落足精确率、召回率、配对后的
+时间、平面位置及 yaw 误差。配对需要脚别一致且落地时间相距不超过 0.2 秒。
+留出划分用于检验落足头。冻结的 LMM 可能在此前训练见过留出片段的参考动作。
+旧版 v1 落足头使用 LMM 根坐标标签，需要从已有实测数据重新训练第一阶段。
+
+```bash
+# 现有兼容 LMM 可直接验证。需要按较长时域训练 LMM 时可选 100 帧。
+bash run_lmm_frax.sh --stepper-window 100 --out logs/roban_lmm_frax_s17_001
+
+bash run_lmm_contact_planner.sh stage1 \
+  --lmm logs/roban_lmm_frax_s17_001/model \
+  --codec logs/roban_lmm_frax_s17_001/codec \
+  --upstream-roban logs/motion_matching_upstream_roban_frax_001 \
+  --data data/roban_frax_upstream_contacts_001 \
+  --out logs/roban_lmm_foothold_stage1_001
+```
+
+第二阶段先生成起停、走跑切换和左右转向的 LMM 参考，再运行 WBC 教师采集
+带指令的实测接触。传入已经训好的方案 2 接触控制器，用 MuJoCo 闭环数据
+做 PPO 微调，落足头同时用教师样本及通过验收的实际闭环样本继续做监督。
+LMM 的三组权重保持冻结。计划用世界落点执行，重规划时保留即将落地的
+目标。发生后续指令变化的预测窗口不进入落足监督。
+
+```bash
+bash run_lmm_contact_planner.sh stage2 \
+  --lmm logs/roban_lmm_frax_s17_001/model \
+  --head logs/roban_lmm_foothold_stage1_001/best.pt \
+  --teacher logs/roban_lafan1_frax_s17_mimic_002/last.pt \
+  --controller logs/roban_frax_contact_controller_001/last.pt \
+  --out logs/roban_lmm_foothold_stage2_001
+```
+
+`--scenarios` 可传入 JSON，键为场景名，值为从 0 秒开始的
+`[秒数, vx, vy, vyaw]` 行列表。`--prepared` 可复用上一次输出中的
+`prepared/`，其中包含场景参考和 WBC 回放，使用时可省略 `--teacher`。
+场景参考在配置时长后保持最后一个指令，为末尾的落足确认留出余量。
+接管比例按完整回合选择，初始默认 0.15。每次提高前至少检查 3 个有运动的
+计划回合，最近最多 12 个回合中至少 60% 要通过存活、进度和实测落足验收。
+落足匹配要求同脚且在
+0.12 秒、0.12 米及 0.45 弧度内。训练日志单独记录计划回合数及通过数。
+`head.pt` 为落足头，`last.pt` 含更新后的控制器与落足头。
+`latest_rollouts/` 保存最近一轮的实际状态、测得的法向力、支撑点速度、
+已下发的目标和实测落足事件，可用于排查接管之后的动作。
+第二阶段的 PPO checkpoint 可与同一套 LMM 权重复用。采用旧落足坐标系的
+第二阶段权重需回到原始接触控制器重新做联合微调。通用
+`evaluate_tracker` 使用实测计划评估控制器，联合闭环结果见第二阶段
+`train.jsonl`。BlinkMimic 第一阶段入口使用其自己的 checkpoint。

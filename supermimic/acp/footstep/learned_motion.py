@@ -3,6 +3,7 @@
 import argparse
 from dataclasses import dataclass, replace
 import hashlib
+import math
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +13,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from .motion_codec import Q, load_codec
-from .motion_matching import (Database, POSTURE_WEIGHT, Robot, STANCE_WEIGHT,
-                              clip_sampling_weights, command_trajectory, intent_mode, rotate)
+from .motion_matching import (Database, LOOKAHEAD, POSTURE_WEIGHT, Robot, STANCE_WEIGHT,
+                              clip_sampling_weights, command_trajectory, intent_mode, planar_heading, rotate)
 from .motion_stepper import load_latents, load_stepper
 
 
@@ -35,6 +36,41 @@ class PlaybackState:
     ticks_to_project: int = 0
     outgoing: torch.Tensor | None = None
     blend_tick: int = 0
+    target_heading: float | None = None
+
+
+@dataclass(frozen=True)
+class HeadingCommand:
+    drive: tuple[float, float]
+    heading: float | None
+    turn_speed: float
+
+    def resolve(self, facing):
+        error = 0. if self.heading is None else math.remainder(self.heading - facing, math.tau)
+        # Either direction is valid for the exact half turn. Pick a deterministic side.
+        if abs(abs(error) - math.pi) < 1e-6:
+            error = math.pi
+        turn = np.clip(5. * error, -self.turn_speed, self.turn_speed)
+        return np.array([*self.drive, turn]), error
+
+    def trajectory(self, error, velocity, yaw_rate):
+        """Build the three LMM query points with the C++ player's heading/travel springs."""
+        rate = 2. * math.log(2.) / .27
+        if self.heading is None:
+            error, yaw_rate = 0., 0.
+        yaw = error + (-error + (yaw_rate - error * rate) * LOOKAHEAD) * np.exp(-rate * LOOKAHEAD)
+        position, acceleration = np.zeros(2), np.zeros(2)
+        result = []
+        for dt, goal in zip(np.diff(np.r_[0., LOOKAHEAD]), rotate(self.drive, yaw), strict=True):
+            start = velocity - goal
+            slope = acceleration + rate * start
+            decay = math.exp(-rate * dt)
+            position = position + goal * dt + start / rate + slope / rate**2 - decay * (
+                slope / rate**2 + (start + slope * dt) / rate)
+            velocity = goal + decay * (start + slope * dt)
+            acceleration = decay * (acceleration - slope * rate * dt)
+            result.append(position)
+        return np.stack(result), planar_heading(yaw)
 
 
 class LearnedPlayback:
@@ -57,9 +93,10 @@ class LearnedPlayback:
         self.projector = LatentProjector(len(self.input_mean), len(self.stepper.mean)).eval()
         self.projector.load_state_dict(saved["projector"])
         seed = (saved["standing_seed"]-self.stepper.mean)/self.stepper.std
-        self.state = PlaybackState(seed, np.zeros(2), 0., np.zeros(3))
+        self.state = self.seed_state = PlaybackState(seed, np.zeros(2), 0., np.zeros(3))
         self.blend_ticks = round(.22*self.fps)
         self.project_interval = round(.25*self.fps)
+        self.on_committed_projection = None
 
     def decode(self, motion):
         state = motion*self.stepper.std+self.stepper.mean
@@ -87,28 +124,50 @@ class LearnedPlayback:
         q[self.robot.joint_qpos] = pose[Q]
         return q, pose[5:7], yaw_rate
 
-    def projection(self, motion, command):
+    def projection_input(self, motion, command, trajectory=None):
         state = motion*self.stepper.std+self.stepper.mean
         current = state[:self.feature_dim]
-        displacement, direction = command_trajectory(command)
+        displacement, direction = command_trajectory(command) if trajectory is None else trajectory
         desired = torch.as_tensor(np.r_[displacement.ravel(), direction.ravel()], dtype=current.dtype)
         desired *= self.feature_scale[-len(desired):]
         pose, contact = self.decode(motion)
         query = torch.cat((current[:-len(desired)], desired, torch.as_tensor(command, dtype=current.dtype),
                            pose[Q]*POSTURE_WEIGHT, contact.sigmoid()*STANCE_WEIGHT))
-        projected = self.projector((query-self.input_mean)/self.input_std)
-        predicted = projected*self.stepper.std+self.stepper.mean
-        error = (current[-len(desired):]-desired).square().sum()
-        improved = (predicted[self.feature_dim-len(desired):self.feature_dim]-desired).square().sum()
-        return projected, improved < error
+        return (query-self.input_mean)/self.input_std, desired, current[-len(desired):]
 
-    def step(self, state, command, root_velocity=None):
+    def projection(self, motion, command, trajectory=None, on_commit=None, force=False):
+        query, desired, current = self.projection_input(motion, command, trajectory)
+        projected = self.projector(query)
+        predicted = projected*self.stepper.std+self.stepper.mean
+        error = (current-desired).square().sum()
+        improved = (predicted[self.feature_dim-len(desired):self.feature_dim]-desired).square().sum()
+        accept = improved < error
+        if on_commit is not None and (force or accept):
+            projected = on_commit(query, projected)
+        return projected, accept
+
+    def step(self, state, command, root_velocity=None, *, on_commit=None):
+        intent = command if isinstance(command, HeadingCommand) else None
+        target_heading = None if intent is None else intent.heading
+        if intent is not None:
+            command, error = intent.resolve(state.yaw)
         changed = np.any(np.abs(command-state.previous_command) > [.075, .075, .12])
+        if target_heading is not None and state.target_heading is not None:
+            changed |= abs(math.remainder(target_heading - state.target_heading, math.tau)) > .12
+        else:
+            changed |= (target_heading is None) != (state.target_heading is None)
         if state.outgoing is None and (state.ticks_to_project <= 0 or changed):
-            target, improves = self.projection(state.motion, command)
+            trajectory = None
+            if intent is not None:
+                if root_velocity is None:
+                    _, velocity, yaw_rate = self.pose_and_velocity(state)
+                    root_velocity = velocity, yaw_rate
+                trajectory = intent.trajectory(error, *root_velocity)
+            target, improves = self.projection(state.motion, command, trajectory, on_commit, force=changed)
             if changed or improves:
                 state = replace(state, motion=target, outgoing=state.motion, blend_tick=0)
-            state = replace(state, previous_command=command.copy(), ticks_to_project=self.project_interval)
+            state = replace(state, previous_command=command.copy(), ticks_to_project=self.project_interval,
+                            target_heading=target_heading)
 
         if root_velocity is None:
             _, local_velocity, rate = self.pose_and_velocity(state)
@@ -120,12 +179,12 @@ class LearnedPlayback:
         blend_tick = state.blend_tick+1 if outgoing is not None else 0
         outgoing = self.stepper(outgoing) if outgoing is not None and blend_tick < self.blend_ticks else None
         return PlaybackState(self.stepper(state.motion), xy, next_yaw, state.previous_command,
-                             state.ticks_to_project-1, outgoing, blend_tick)
+                             state.ticks_to_project-1, outgoing, blend_tick, state.target_heading)
 
     @torch.inference_mode()
     def advance_reference(self, command, steps):
         for _ in range(steps):
-            self.state = self.step(self.state, command)
+            self.state = self.step(self.state, command, on_commit=self.on_committed_projection)
 
     @torch.inference_mode()
     def forecast_reference(self, command, steps):

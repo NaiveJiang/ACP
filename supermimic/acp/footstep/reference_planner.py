@@ -49,11 +49,16 @@ class ReferencePlanner:
         self.tick = 0
         self.previous_command = np.zeros(3)
 
-    def plan(self, command):
+    def plan(self, command, *, dense_offsets=None):
         """Advance to this policy sample and forecast using its held body-frame command."""
-        command = np.asarray(command, dtype=float)
-        if command.shape != (3,) or not np.isfinite(command).all():
-            raise ValueError("Command must contain finite vx, vy, and yaw rate")
+        offsets = self.offsets if dense_offsets is None else dense_offsets
+        from .learned_motion import HeadingCommand
+
+        if not isinstance(command, HeadingCommand):
+            command = np.asarray(command, dtype=float)
+            if command.shape != (3,) or not np.isfinite(command).all():
+                raise ValueError("Command must contain finite vx, vy, and yaw rate")
+            command = command.copy()
         base_tick, fraction = divmod(self.frame*self.source_hz, POLICY_HZ)
         self.playback.advance_reference(self.previous_command, base_tick-self.tick)
         self.tick = base_tick
@@ -67,22 +72,22 @@ class ReferencePlanner:
             self.tick += 1
 
         # Include the samples bracketing each future pose for centered velocities.
-        samples = np.arange(self.offsets[-1]+2)
+        samples = np.arange(offsets[-1]+2)
         source_ticks = (fraction+samples*self.source_hz)/POLICY_HZ
         steps = math.ceil(source_ticks[-1])-len(prefix)
         forecast = self.playback.forecast_reference(command, steps)
         poses = np.concatenate((*prefix, forecast))[:, self.columns]
-        self.previous_command = command.copy()
+        self.previous_command = command
         time = np.arange(len(poses))
         sampled = np.column_stack([np.interp(source_ticks, time, x) for x in poses.T])
         rotation = Slerp(time, Rotation.from_quat(poses[:, 3:7], scalar_first=True))(source_ticks)
         sampled[:, 3:7] = rotation.as_quat(scalar_first=True)
 
-        lo, hi = self.offsets-1, self.offsets+1
+        lo, hi = offsets-1, offsets+1
         derivative = (sampled[hi]-sampled[lo])*(POLICY_HZ/2.)
         angular = (rotation[hi]*rotation[lo].inv()).as_rotvec()*(POLICY_HZ/2.)
         self.frame += 1
-        return ReferenceWindow(sampled[0], sampled[self.offsets], derivative[:, :3], angular, derivative[:, 7:])
+        return ReferenceWindow(sampled[0], sampled[offsets], derivative[:, :3], angular, derivative[:, 7:])
 
 
 def main():

@@ -26,7 +26,7 @@ def main():
     import torch
     import numpy as np
     from .reference import FootstepMotion
-    from .backend import backend_for_format
+    from .backend import ROLLOUT_FORMAT, backend_for_format
     from .env import FootstepTrackingSim
     from ..robot import default_joint_pos_list, metadata
     from ..kinematics import RobotKinematics
@@ -38,22 +38,33 @@ def main():
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     ck = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
-    backend = backend_for_format(ck.get("format"))
+    config = ck["config"]
+    rollout = ck.get("format") == ROLLOUT_FORMAT
+    backend = backend_for_format(ck.get("format"), event_slots=config.get("event_slots"))
     joint=getattr(backend,'joint',False)
     FootstepTask, FootstepMDP, TrackerPolicy = backend.Task, backend.MDP, backend.Policy
     OBS_DIM, ContactRewardCfg = backend.obs_dim, backend.RewardCfg
     if ck["robot"]["fingerprint"] != metadata()["fingerprint"]:
         raise ValueError("Incompatible tracker checkpoint")
-    config = ck["config"]
     kin = RobotKinematics(args.device)
-    motion = FootstepMotion(ck["split"]["val"], kin, args.device, config["horizons"], args.max_clips,
-                            reserve_steps=getattr(backend,"reserve_steps",0))
+    policy_kwargs = {}
+    if rollout:
+        from .rollout_controller import RolloutMotion
+
+        motion = RolloutMotion(ck["split"]["val"], kin, args.device, config["event_slots"], args.max_clips)
+        policy_kwargs["event_slots"] = config["event_slots"]
+    else:
+        motion = FootstepMotion(ck["split"]["val"], kin, args.device, config["horizons"], args.max_clips,
+                                reserve_steps=getattr(backend,"reserve_steps",0))
+    if joint:
+        policy_kwargs['planner_config'] = config['planner_config']
     task = FootstepTask(motion, kin, ContactRewardCfg(**ck["reward"]))
     mdp = FootstepMDP(kin, motion, torch.tensor(default_joint_pos_list(), device=args.device), task)
-    policy = TrackerPolicy(config["hist"], config["policy_hidden"],**(dict(planner_config=config['planner_config']) if joint else {})).to(args.device)
+    policy = TrackerPolicy(config["hist"], config["policy_hidden"], **policy_kwargs).to(args.device)
     policy.load_state_dict(ck["pi"])
     policy.eval()
-    env = getattr(backend,'Env',FootstepTrackingSim)(args.num_envs, motion, mdp, args.device, eval_mode=True, reset_noise=False)
+    env = getattr(backend,'Env',FootstepTrackingSim)(args.num_envs, motion, mdp, args.device, eval_mode=True,
+                                                    reset_noise=False, reference_reset_action=rollout)
     history = torch.zeros(args.num_envs, config["hist"], OBS_DIM, device=args.device)
     query = task.sample_queries(args.num_envs)
     reward, heights, positions, contact_matches, episodes = [], [], [], [], []
@@ -99,7 +110,7 @@ def main():
                     rmse=np.sqrt(np.mean(error**2, axis=0)).tolist())
     categories = np.asarray([motion.sources[i]["category"] for i in visited])
     report = dict(format="two_foot_oracle_tracker_eval_v1", controller_format=backend.format,
-                  command_dim=backend.command_dim, speed_is_actor_input=(joint or backend.command_dim == 16),
+                  command_dim=backend.command_dim, speed_is_actor_input=(joint or backend.command_dim == 16) and not rollout,
                   checkpoint=str(Path(args.checkpoint).resolve()),
                   iteration=ck["iteration"], args=vars(args), held_out_clips=motion.names,
                   oracle_targets=not joint, completed_episodes=len(episodes), terminations=falls,
@@ -115,6 +126,11 @@ def main():
         report.update(velocity_enters_planner=True,velocity_enters_controller=False,controller_command_dim=13)
         report['reference_support_position_mean_m']=report.pop('support_position_mean_m')
         report['reference_geometry_contact_match']=report.pop('geometry_contact_match')
+    if rollout:
+        report['event_slots'] = config['event_slots']
+        report['style_reference'] = 'measured_rollout'
+        report['measured_rollout_twist_comparison'] = report.pop('speed_tracking')
+        report['measured_rollout_twist_per_category'] = report.pop('speed_tracking_per_category')
     (out/"evaluation.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2), flush=True)
 

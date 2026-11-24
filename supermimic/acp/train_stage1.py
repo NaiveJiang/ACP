@@ -83,6 +83,8 @@ parser.add_argument("--pi_ema", type=float, default=.995)
 parser.add_argument("--task", choices=("contact", "reference"), default="contact")
 parser.add_argument("--reference_offsets", type=int, nargs="+", default=[1, 5, 10, 20, 30, 50])
 parser.add_argument("--reference_action_skip", action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument("--reference_root", choices=("world", "local"), default="world",
+                    help="Reference root commands with or without a global planar path")
 parser.add_argument("--knee_tracking_weight", type=float, default=0.0,
                     help="Additional smooth joint-angle tracking cost for both RoBan knees")
 parser.add_argument("--ground_friction_range", type=float, nargs=2, metavar=("LOW", "HIGH"))
@@ -110,6 +112,8 @@ if not math.isfinite(args.knee_tracking_weight) or args.knee_tracking_weight < 0
     parser.error("knee_tracking_weight must be finite and nonnegative")
 if args.knee_tracking_weight and not reference_task:
     parser.error("knee_tracking_weight requires the reference task")
+if args.reference_root == "local" and not reference_task:
+    parser.error("--reference_root local requires the reference task")
 if args.reference_offsets != sorted(set(args.reference_offsets)) or min(args.reference_offsets) < 0:
     parser.error("Reference offsets must be sorted, unique and nonnegative")
 if not 0 <= args.pi_ema < 1:
@@ -201,9 +205,10 @@ kin = RobotKinematics(dev)
 motion = MotionLib.from_dir(motion_dir, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
           RewardCfg(w_knee_tracking=args.knee_tracking_weight,
-                    w_self_collision=args.self_collision_weight),
+                    w_self_collision=args.self_collision_weight,
+                    local_reference_root=args.reference_root == "local"),
           independent_surface_friction=independent_friction, delay_steps=delay_steps)
-ctc_cfg = (ReferenceCfg(tuple(args.reference_offsets), args.reference_action_skip) if reference_task
+ctc_cfg = (ReferenceCfg(tuple(args.reference_offsets), args.reference_action_skip, args.reference_root) if reference_task
            else ContactCfg(contacts_dir=args.contacts_dir, target_noise=args.target_noise, scan_noise=args.scan_noise, w_label=args.w_label,
                            target_point=args.target_point, target_min_steps=args.target_min_steps, blind=args.blind))
 ctc = ReferenceTask(ctc_cfg, mdp) if reference_task else ContactTask(ctc_cfg, mdp, motion_dir, dev)

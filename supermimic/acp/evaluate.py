@@ -25,6 +25,7 @@ parser.add_argument("--ckpt", type=str, required=True)
 reference_source = parser.add_mutually_exclusive_group()
 reference_source.add_argument("--motion-dir", help="Reference motions to evaluate instead of the checkpoint's motion directory")
 reference_source.add_argument("--upstream-roban", type=Path, help="Mapped upstream Motion Matching library")
+reference_source.add_argument("--forecast", type=Path, help="LMM forecast.npz, with its sibling planned/ directory")
 parser.add_argument("--clip", help="One clip, such as walk/walk for --motion-dir or walk for --upstream-roban")
 parser.add_argument("--start-seconds", type=float, default=0., help="Start inside the selected upstream clip")
 parser.add_argument("--viewer", action="store_true", help="Play a clip or the entire upstream library in a live MuJoCo window")
@@ -42,8 +43,10 @@ parser.add_argument("--train_noise", nargs="*", default=None, choices=["obs", "c
                          " actions (0.1)")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
-if args.viewer and not (args.clip or args.upstream_roban):
-    parser.error("--viewer requires --clip or --upstream-roban")
+if args.viewer and not (args.clip or args.upstream_roban or args.forecast):
+    parser.error("--viewer requires --clip, --upstream-roban, or --forecast")
+if args.forecast and args.clip:
+    parser.error("--forecast already specifies a single planned clip")
 if not math.isfinite(args.start_seconds) or args.start_seconds < 0 or (
     args.start_seconds and not (args.upstream_roban and args.clip)
 ):
@@ -76,9 +79,25 @@ a_ = ck["args"]
 ia = ck.get("init_args", a_)
 motion_dir = args.motion_dir or ia.get("motion_dir") or MOTION_DIR
 kin = RobotKinematics(dev)
-if (args.clip or args.upstream_roban) and ck.get("task_interface") != "reference_mimic_v1":
-    parser.error("--clip and --upstream-roban require a full-body reference checkpoint")
-if args.upstream_roban:
+if (args.clip or args.upstream_roban or args.forecast) and ck.get("task_interface") != "reference_mimic_v1":
+    parser.error("--clip, --upstream-roban and --forecast require a full-body reference checkpoint")
+forecast = None
+if args.forecast:
+    root = args.forecast.parent / "planned"
+    motion = MotionLib([str(root / "velocity_demo_motion.npz")], kin, dev, root=str(root))
+    offsets = ck["reference_cfg"]["offsets"]
+    with np.load(args.forecast, allow_pickle=False) as source:
+        if not np.array_equal(source["offsets"], offsets):
+            parser.error(f"Forecast offsets must match this controller's offsets {offsets}")
+        shapes = (("root_position", (3,)), ("root_rotation", (3, 3)), ("root_linear_velocity", (3,)),
+                  ("root_angular_velocity", (3,)), ("joint_position", (len(JOINT_NAMES),)),
+                  ("joint_velocity", (len(JOINT_NAMES),)))
+        arrays = [source[name] for name, _ in shapes]
+        if any(array.shape != (motion.num_frames, len(offsets), *shape) or not np.isfinite(array).all()
+               for array, (_, shape) in zip(arrays, shapes, strict=True)):
+            parser.error("Invalid forecast shapes or nonfinite frames in the LMM forecast")
+        forecast = tuple(torch.as_tensor(array, dtype=torch.float32, device=dev) for array in arrays)
+elif args.upstream_roban:
     from supermimic.acp.footstep.motion_matching import Database, Robot, upstream_clips
 
     if ROBOT_ID != "roban":
@@ -127,13 +146,16 @@ ground_friction, box_friction = evaluation_surface_friction(
 friction_override = ground_friction is not None or box_friction is not None
 ground_friction = 1.0 if ground_friction is None else ground_friction
 box_friction = 1.0 if box_friction is None else box_friction
+reference_task = ck.get("task_interface") == "reference_mimic_v1"
+reference_cfg = ReferenceCfg(**ck["reference_cfg"]) if reference_task else None
+local_reference_root = reference_cfg is not None and reference_cfg.root_reference == "local"
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
           RewardCfg(term_window=int(round(term_win / CONTROL_DT)),
                     w_knee_tracking=a_.get("knee_tracking_weight", 0.0),
-                    w_self_collision=a_.get("self_collision_weight", 0.0)),
+                    w_self_collision=a_.get("self_collision_weight", 0.0),
+                    local_reference_root=local_reference_root),
           independent_surface_friction=friction_override, delay_steps=delay_steps)
-reference_task = ck.get("task_interface") == "reference_mimic_v1"
-ctc = (ReferenceTask(ReferenceCfg(**ck["reference_cfg"]), mdp) if reference_task
+ctc = (ReferenceTask(reference_cfg, mdp) if reference_task
        else ContactTask(ContactCfg(**ck["ctc_cfg"]), mdp, motion_dir, dev))
 Hh = ia["hist"]
 networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
@@ -203,8 +225,14 @@ def evaluate(viewer=None, clips=None, record_path=None) -> dict | None:
             pw, pv = plan(planner, scan, pcfg, ctc, hist, S, env.f, env.v, gs, noise=NOISE_CMD)
             use = torch.rand(C, device=dev) < args.eta_obs
             tw, tv = torch.where(use[:, None, None], pw, tw), torch.where(use[:, None], pv, tv)
-        cmd = (ctc.command(S, env.f, env.v, gs) if reference_task else
-               ctc.command(S, env.f, env.v, gs, noise=NOISE_CMD, targets_w=tw, valid=tv))
+        if forecast is not None:
+            window = tuple(array[env.f] for array in forecast)
+            anchor = (motion.root_p[env.f], motion.root_R[env.f]) if local_reference_root else None
+            cmd = ctc.command_from_reference(S, window, motion.boxes(env.f, env.v), anchor=anchor)
+        elif reference_task:
+            cmd = ctc.command(S, env.f, env.v, gs)
+        else:
+            cmd = ctc.command(S, env.f, env.v, gs, noise=NOISE_CMD, targets_w=tw, valid=tv)
         alive = ~env.done_eval.clone()
         tw_win, tv_win = torch.cat((tw_win[1:], tw[None])), torch.cat((tv_win[1:], tv[None]))
         if record_path:
@@ -277,6 +305,7 @@ def evaluate(viewer=None, clips=None, record_path=None) -> dict | None:
         ]} if mdp.self_collision_penalty is not None else {}),
         "surface_friction": {"ground": ground_friction, "box": box_friction},
         "interface": "reference_mimic" if reference_task else "planner" if args.planner else "reference",
+        **({"forecast": str(args.forecast)} if forecast is not None else {}),
         "inactive_terrain_parked": True,
         "eta_obs": args.eta_obs if args.planner else 0.0,
         "term_window": term_win,

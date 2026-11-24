@@ -42,6 +42,13 @@ class ReferenceViewer:
             thread.join(timeout=5.)
 
     def show(self, state, frame, *, follow_reference=False):
+        p, r, _, _, j, _ = self.motion.ref_state(frame)
+        ref = np.concatenate((p[0].cpu().numpy(), mat_to_quat(r)[0].cpu().numpy(), j[0].cpu().numpy()))
+        clip = self.motion.clip_id[frame]
+        time_s = int((frame-self.motion.clip_start[clip])[0]) * CONTROL_DT
+        return self.show_reference(state, ref, time_s, follow_reference=follow_reference)
+
+    def show_reference(self, state, reference, time_s, *, follow_reference=False):
         if self.last_frame_time is not None:
             time.sleep(max(0., self.last_frame_time + CONTROL_DT - time.monotonic()))
         if not self.viewer.is_running():
@@ -49,13 +56,10 @@ class ReferenceViewer:
         position, rotation, _, _, joints, _ = state
         q = np.concatenate((position[0].cpu().numpy(), mat_to_quat(rotation)[0].cpu().numpy(),
                             joints[0].cpu().numpy()))
-        p, r, _, _, j, _ = self.motion.ref_state(frame)
-        ref = np.concatenate((p[0].cpu().numpy(), mat_to_quat(r)[0].cpu().numpy(), j[0].cpu().numpy()))
         with self.viewer.lock():
-            self.data.qpos[:] = np.concatenate((q, ref))
-            clip = self.motion.clip_id[frame]
-            self.data.time = int((frame-self.motion.clip_start[clip])[0]) * CONTROL_DT
-            camera_target = ref if follow_reference else q
+            self.data.qpos[:] = np.concatenate((q, reference))
+            self.data.time = time_s
+            camera_target = reference if follow_reference else q
             self.viewer.cam.lookat[:] = (*camera_target[:2], .6)
             mujoco.mj_kinematics(self.model, self.data)
         self.viewer.sync()

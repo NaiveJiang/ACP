@@ -28,6 +28,9 @@ class FootContactForces:
         self.count = env.N
 
     def contact(self):
+        return self.normal_force() >= 5.
+
+    def normal_force(self):
         data = self.sim.wp_data
         count = wp.to_torch(data.nacon)
         self.overflow.logical_or_((count>self.contact_ids.numel()).any())
@@ -40,7 +43,7 @@ class FootContactForces:
         valid = (self.contact_ids < count) & (foot >= 0)
         summed = normal.new_zeros(2*self.count)
         summed.scatter_add_(0,2*world+foot.clamp_min(0),torch.where(valid,normal,0.))
-        return summed.view(self.count,2) >= 5.
+        return summed.view(self.count,2)
 
 
 class EventRollout:

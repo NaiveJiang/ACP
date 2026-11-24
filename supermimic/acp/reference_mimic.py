@@ -16,6 +16,11 @@ from .terrain import grid_offsets, height_scan
 class ReferenceCfg:
     offsets: tuple[int, ...] = (1, 5, 10, 20, 30, 50)
     reference_action_skip: bool = True
+    root_reference: str = "world"
+
+    def __post_init__(self):
+        if self.root_reference not in ("world", "local"):
+            raise ValueError("root_reference must be world or local")
 
 
 class ReferenceTask:
@@ -40,14 +45,22 @@ class ReferenceTask:
         )
         window = (motion.root_p[future], motion.root_R[future], motion.root_v[future],
                   motion.root_w[future], motion.q[future], motion.qd[future])
-        return self.command_from_reference(state, window, motion.boxes(frames, variants))
+        anchor = (motion.root_p[frames], motion.root_R[frames]) if self.cfg.root_reference == "local" else None
+        return self.command_from_reference(state, window, motion.boxes(frames, variants), anchor=anchor)
 
-    def command_from_reference(self, state, window, boxes):
+    def command_from_reference(self, state, window, boxes, *, anchor=None):
         """Encode an externally planned window in the same order as training."""
         root_position, root_rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = window
-        inverse = yaw_mat(state[1]).transpose(-1, -2)[:, None]
+        if self.cfg.root_reference == "local":
+            if anchor is None:
+                raise ValueError("Local reference conditioning requires the current reference pose")
+            origin = torch.cat((anchor[0][..., :2], state[0][..., 2:3]), dim=-1)
+            yaw = anchor[1]
+        else:
+            origin, yaw = state[:2]
+        inverse = yaw_mat(yaw).transpose(-1, -2)[:, None]
         position = (
-            inverse @ (root_position - state[0][:, None])[..., None]
+            inverse @ (root_position - origin[:, None])[..., None]
         ).squeeze(-1)
         orientation = mat_to_6d(inverse @ root_rotation)
         velocity = (inverse @ linear_velocity[..., None]).squeeze(-1)

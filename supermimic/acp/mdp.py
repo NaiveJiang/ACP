@@ -44,6 +44,7 @@ class RewardCfg:
     w_joint_limit: float = -2.0
     w_knee_tracking: float = 0.0
     w_self_collision: float = 0.0
+    local_reference_root: bool = False
     soft_limit_factor: float = SOFT_JOINT_LIMIT_FACTOR
     term_height: float = 0.25
     term_tilt: float = 0.8
@@ -142,16 +143,22 @@ class MDP:
             bv, bw = bv_all[..., ids, :], bw_all[..., ids, :]
         rp, rR = m.root_p[f], m.root_R[f]
         # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        local_root = c.local_reference_root
+        dR = (yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2) if local_root
+              else yaw_mat(R @ rR.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
         e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
         e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        e_lv = ((m.body_v[f] - bv) ** 2).sum(-1).mean(-1)
-        e_av = ((m.body_w[f] - bw) ** 2).sum(-1).mean(-1)
-        e_rp = ((rp - p) ** 2).sum(-1)
-        e_ro = rot_angle_sq(rR, R)
+        ref_v, ref_w = m.body_v[f], m.body_w[f]
+        if local_root:
+            ref_v = (dR.unsqueeze(-3) @ ref_v.unsqueeze(-1)).squeeze(-1)
+            ref_w = (dR.unsqueeze(-3) @ ref_w.unsqueeze(-1)).squeeze(-1)
+        e_lv = ((ref_v - bv) ** 2).sum(-1).mean(-1)
+        e_av = ((ref_w - bw) ** 2).sum(-1).mean(-1)
+        e_rp = ((anchor - p if local_root else rp - p) ** 2).sum(-1)
+        e_ro = rot_angle_sq(dR @ rR if local_root else rR, R)
         r_track = (torch.exp(-e_pos / c.body_pos_std**2) + torch.exp(-e_ori / c.body_ori_std**2) + torch.exp(-e_lv / c.body_linvel_std**2)
                    + torch.exp(-e_av / c.body_angvel_std**2) + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
                    + 0.5 * torch.exp(-e_ro / c.root_ori_std**2))  # fmt: skip
@@ -206,10 +213,12 @@ class MDP:
         Ht = yaw_mat(R).transpose(-1, -2)
         rp, rR = m.root_p[f], m.root_R[f]
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
-        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        local_root = self.cfg.local_reference_root
+        dR = (yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2) if local_root
+              else yaw_mat(R @ rR.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         e_body = (Ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2)
-        e_root = (Ht @ (rp - p).unsqueeze(-1)).squeeze(-1)
-        rel = mat_to_6d(R.transpose(-1, -2) @ rR)
+        e_root = (Ht @ ((anchor - p) if local_root else (rp - p)).unsqueeze(-1)).squeeze(-1)
+        rel = mat_to_6d(R.transpose(-1, -2) @ (dR @ rR if local_root else rR))
         return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, rel, xi_n, self.scan(S, boxes)), -1)

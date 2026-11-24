@@ -184,6 +184,12 @@ def state_array(state):
     return flatten_state(state)[0].detach().cpu().numpy()
 
 
+def write_manifest(output, report):
+    pending = output / "manifest.json.tmp"
+    pending.write_text(json.dumps(report, indent=2) + "\n")
+    pending.replace(output / "manifest.json")
+
+
 @torch.no_grad()
 def collect(args):
     checkpoint = load_checkpoint(args.ckpt, map_location=args.device, weights_only=True)
@@ -195,7 +201,22 @@ def collect(args):
     torch.manual_seed(args.seed)
     networks.AMP_DTYPE = torch.bfloat16 if checkpoint["args"]["amp"] == "bf16" else None
     kin = RobotKinematics(args.device)
-    motion_dir = args.motion_dir or checkpoint["args"]["motion_dir"]
+    episodes = None
+    if args.upstream_roban is not None or args.planned_reference is not None:
+        from . import frax_rollout
+
+        args.output.mkdir(parents=True, exist_ok=False)
+        if args.planned_reference is None:
+            motion_dir, episodes = frax_rollout.prepare_references(
+                args.upstream_roban, args.output, args.case, args.window_seconds,
+                args.min_support_steps, max(cfg.offsets),
+            )
+        else:
+            from .footstep.lmm_contact_scenarios import read_scenarios
+
+            motion_dir, episodes = read_scenarios(args.planned_reference)
+    else:
+        motion_dir = args.motion_dir or checkpoint["args"]["motion_dir"]
     motion = MotionLib.from_dir(motion_dir, kin, args.device)
     ground, box = evaluation_surface_friction(checkpoint["args"])
     delay_steps = DELAY_STEPS if checkpoint["args"].get("s17_actuators") else 0
@@ -203,14 +224,15 @@ def collect(args):
     primitive_soles = checkpoint["args"].get("primitive_soles", False)
     mdp = MDP(
         kin, motion, torch.tensor(default_joint_pos_list(), device=args.device),
-        RewardCfg(w_self_collision=self_collision_weight),
+        RewardCfg(w_self_collision=self_collision_weight, local_reference_root=cfg.root_reference == "local"),
         independent_surface_friction=ground is not None, delay_steps=delay_steps,
     )
     task = ReferenceTask(cfg, mdp)
     policy = build_policy(mdp, task, checkpoint["args"]["hist"]).to(args.device)
     policy.load_state_dict(checkpoint["pi_ema"] if args.ema else checkpoint["pi"])
     policy.eval()
-    args.output.mkdir(parents=True, exist_ok=False)
+    if episodes is None:
+        args.output.mkdir(parents=True, exist_ok=False)
     report = {
         "checkpoint": str(Path(args.ckpt).resolve()),
         "checkpoint_sha256": hashlib.sha256(Path(args.ckpt).read_bytes()).hexdigest(),
@@ -220,6 +242,7 @@ def collect(args):
         "reference_cfg": dataclasses.asdict(cfg),
         "attempts": [],
         "successful_rollouts": 0,
+        "completed": False,
         "force_method": "mujoco_warp.contact_force after each physics step; no CPU re-solve",
         "physics_dt": PHYSICS_DT,
         "s17_actuators": bool(delay_steps),
@@ -236,6 +259,11 @@ def collect(args):
         key: str(value) if isinstance(value, Path) else value
         for key, value in report["args"].items()
     }
+    if episodes is not None:
+        report["sample_schema"] = frax_rollout.SCHEMA
+        report["valid_samples"] = 0
+        report["touchdown_events"] = 0
+    write_manifest(args.output, report)
     env = TrackingSim(
         1, motion, mdp, args.device, eval_mode=True, reference_reset_action=True,
         ground_friction_range=None if ground is None else (ground, ground),
@@ -246,8 +274,12 @@ def collect(args):
     env.substep_callback = recorder
     clips = range(min(args.max_clips or len(motion.names), len(motion.names)))
     for clip in clips:
+        start, end = int(motion.clip_start[clip]), int(motion.clip_end[clip])
+        episode = episodes[motion.names[clip]] if episodes is not None else None
+        if episode is not None:
+            # Leave extra frames accessible to the WBC command without executing them twice.
+            end = start + episode["reference_end_frame_50hz"] - episode["reference_start_frame_50hz"]
         for attempt in range(args.attempts):
-            start, end = int(motion.clip_start[clip]), int(motion.clip_end[clip])
             variant = motion.first_variants(torch.tensor([clip], device=args.device))
             env.done_eval.zero_()
             env.failed_eval.zero_()
@@ -263,6 +295,7 @@ def collect(args):
                 [],
             )
             reference_frames = [start]
+            observations = []
             history = env.observe()[:, None].repeat(1, policy.hist, 1)
             initial_action = env.a_prev[0].cpu().numpy().copy()
             valid = True
@@ -279,6 +312,8 @@ def collect(args):
                 )
                 recorder.begin(len(states))
                 transition = env.step(action)
+                if episodes is not None:
+                    observations.append(transition["o"][0].cpu().numpy())
                 if "self_overlap" in transition and bool(transition["valid"][0]):
                     overlaps.append(float(transition["self_overlap"][0]))
                 contact, raw = recorder.finish()
@@ -328,6 +363,12 @@ def collect(args):
             if args.max_steps and len(actions) < end - start:
                 reasons.append("truncated_by_max_steps")
             name = f"{motion.names[clip]}_attempt{attempt:03d}"
+            alignment = {}
+            if episodes is not None:
+                observations.append(env.observe()[0].cpu().numpy())
+                alignment = frax_rollout.align_attempt(
+                    states, reference_frames, contacts, motion, clip, kin, np.asarray(observations)
+                )
             path = args.output / "attempts" / (name + ".npz")
             path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
@@ -345,6 +386,7 @@ def collect(args):
                 transition_terminated=np.asarray(terminations),
                 time_s=np.arange(len(states)) * CONTROL_DT,
                 initial_contact_measured=False,
+                **alignment,
             )
             entry = {
                 "source_clip": motion.names[clip],
@@ -358,6 +400,10 @@ def collect(args):
             }
             if self_collision_weight:
                 entry["max_self_overlap_m"] = max(overlaps, default=None)
+            if episode is not None:
+                entry["upstream"] = episode
+                xy_error = np.linalg.norm(alignment["qpos"][:, :2] - alignment["reference_qpos"][:, :2], axis=1)
+                entry["max_xy_error_m"] = float(xy_error.max())
             if not reasons:
                 boxes = motion.clip_boxes[clip, int(variant[0])].cpu().numpy()
                 entry["motion"], entry["contacts"] = save_success(
@@ -372,25 +418,43 @@ def collect(args):
                     args.force_threshold,
                 )
                 report["successful_rollouts"] += 1
+                if episodes is not None:
+                    path, count, events = frax_rollout.save_samples(
+                        args.output, name, alignment, actions, args.min_support_steps, args.force_threshold
+                    )
+                    entry.update(samples=path, valid_samples=count, touchdown_events=events)
+                    report["valid_samples"] += count
+                    report["touchdown_events"] += events
             report["attempts"].append(entry)
-            (args.output / "manifest.json").write_text(
-                json.dumps(report, indent=2) + "\n"
-            )
+            write_manifest(args.output, report)
             print(
                 f"{name}: {'exported' if not reasons else 'rejected: ' + ', '.join(reasons)}",
                 flush=True,
             )
     env.substep_callback = None
+    report["completed"] = True
+    write_manifest(args.output, report)
     print(
         f"Exported {report['successful_rollouts']} successful rollouts to {args.output}"
     )
+    if episodes is not None:
+        print(f"Exported {report['valid_samples']} full 1.5 s windows and {report['touchdown_events']} touchdown events")
+    return report
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--motion-dir")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--motion-dir")
+    source.add_argument("--upstream-roban", type=Path, help="Frax S17 upstream library")
+    source.add_argument("--planned-reference", type=Path, help="LMM command-scenario reference library")
+    parser.add_argument("--case", action="append", help="Upstream case to collect; repeat to select multiple")
+    parser.add_argument("--window-seconds", type=float, default=8.0,
+                        help="Duration of each upstream rollout; 0 keeps entire source clips")
+    parser.add_argument("--min-support-steps", type=int, default=5,
+                        help="Minimum sustained loaded steps for an upstream touchdown")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attempts", type=int, default=1)
@@ -405,11 +469,26 @@ def main():
         args.attempts < 1
         or args.max_steps < 0
         or args.max_clips < 0
-        or args.force_threshold <= 0
-        or args.action_noise < 0
+        or not np.isfinite(args.force_threshold) or args.force_threshold <= 0
+        or not np.isfinite(args.action_noise) or args.action_noise < 0
     ):
         parser.error("Invalid capture limits, force threshold or action noise")
-    collect(args)
+    if args.upstream_roban is not None or args.planned_reference is not None:
+        if ROBOT_ID != "roban":
+            parser.error("Frax S17 collection requires ACP_ROBOT=roban")
+        if args.min_support_steps < 3:
+            parser.error("--min-support-steps must be at least 3")
+        from .frax_rollout import FPS, confirmation_tail
+
+        seconds = args.window_seconds
+        if (not np.isfinite(seconds) or seconds < 0
+                or (seconds and round(seconds * FPS) < confirmation_tail(args.min_support_steps))):
+            parser.error("--window-seconds must be 0 or cover the 1.5 s horizon and support confirmation")
+    elif args.case:
+        parser.error("--case requires --upstream-roban")
+    report = collect(args)
+    if (args.upstream_roban is not None or args.planned_reference is not None) and not report["valid_samples"]:
+        parser.exit(1, "No complete 1.5 s training windows; see manifest.json for diagnostics.\n")
 
 
 if __name__ == "__main__":

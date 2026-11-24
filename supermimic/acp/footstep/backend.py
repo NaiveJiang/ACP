@@ -8,6 +8,7 @@ UPPER_SUPERVISED_FORMAT = "two_foot_upper_supervised_tracker_v4"
 GAIT_STYLE_FORMAT = "two_foot_gait_style_tracker_v5"
 LEG_COLLISION_FORMAT = "two_foot_leg_collision_tracker_v6"
 NEXT_CONTACT_FORMAT = "two_foot_acp_next_contact_v1"
+ROLLOUT_FORMAT = "two_foot_rollout_timed_events_v1"
 BODY_GOAL_FORMAT = "two_foot_body_goal_tracker_v1"
 JOINT_FORMAT = "two_foot_joint_planner_controller_v7"
 CONSISTENT_FORMAT = "two_foot_consistent_joint_controller_v8"
@@ -16,7 +17,16 @@ CONSISTENT_FORMAT = "two_foot_consistent_joint_controller_v8"
 WALKING_FORMAT = "two_foot_fixed_controller_planner_v9"
 
 
-def backend_for_format(format_name):
+def backend_for_format(format_name, *, event_slots=None):
+    if format_name == ROLLOUT_FORMAT:
+        from .rollout_controller import EVENT_FIELDS, RolloutMDP, RolloutPolicy, RolloutRewardCfg, RolloutTask
+        from .leg_collision import LegCollisionSim
+
+        if event_slots is None or event_slots < 1:
+            raise ValueError("Rollout checkpoints require a positive event slot count")
+        return SimpleNamespace(Task=RolloutTask, MDP=RolloutMDP, Policy=RolloutPolicy,
+                               RewardCfg=RolloutRewardCfg, Env=LegCollisionSim, obs_dim=69,
+                               command_dim=event_slots * len(EVENT_FIELDS), format=format_name)
     if format_name == NEXT_CONTACT_FORMAT:
         from .next_contact import NextContactMDP, NextContactPolicy, NextContactTask, COMMAND_DIM, REFERENCE_TAIL
         from .leg_collision import LegCollisionCfg, LegCollisionSim

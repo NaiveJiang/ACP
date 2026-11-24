@@ -6,6 +6,7 @@ PYTHON="${FOOTSTEP_PYTHON:-$ROOT/.venv_footstep/bin/python}"
 UPSTREAM="$ROOT/logs/motion_matching_upstream_roban_frax_001"
 OUT="$ROOT/logs/roban_lmm_frax_s17_001"
 check_only=0
+STEPPER_WINDOW=62
 
 while (( $# )); do
     case "$1" in
@@ -20,8 +21,16 @@ while (( $# )); do
             UPSTREAM="$2"
             shift 2
             ;;
+        --stepper-window)
+            if (( $# < 2 )) || [[ ! "$2" =~ ^[1-9][0-9]*$ ]] || (( $2 < 3 )); then
+                printf '%s\n' 'Expected a Stepper window of at least three frames' >&2
+                exit 2
+            fi
+            STEPPER_WINDOW="$2"
+            shift 2
+            ;;
         --help|-h)
-            printf '%s\n' 'Usage: bash run_lmm_frax.sh [--check-only] [--upstream-roban DIRECTORY] [--out NEW_DIRECTORY]'
+            printf '%s\n' 'Usage: bash run_lmm_frax.sh [--check-only] [--upstream-roban DIRECTORY] [--out NEW_DIRECTORY] [--stepper-window FRAMES]'
             exit 0
             ;;
         *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
@@ -66,6 +75,6 @@ if [[ -e "$OUT" ]]; then
 fi
 
 "$PYTHON" -m supermimic.acp.footstep.motion_codec --upstream-roban "$UPSTREAM" --out "$OUT/codec"
-"$PYTHON" -m supermimic.acp.footstep.motion_stepper --codec "$OUT/codec" --window 62 --out "$OUT/stepper"
+"$PYTHON" -m supermimic.acp.footstep.motion_stepper --codec "$OUT/codec" --window "$STEPPER_WINDOW" --out "$OUT/stepper"
 "$PYTHON" -m supermimic.acp.footstep.learned_motion --upstream-roban "$UPSTREAM" \
     --codec "$OUT/codec" --stepper "$OUT/stepper/model.pt" --out "$OUT/model"

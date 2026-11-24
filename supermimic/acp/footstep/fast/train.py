@@ -16,7 +16,8 @@ def main():
     p.add_argument('--log-dir',required=True)
     p.add_argument('--cache-dir',default='data/cache/footstep_v2')
     p.add_argument('--profile',choices=['wbc'],help='Use the WBC RoBan Mimic training settings on the v6 contact task')
-    p.add_argument('--controller',choices=['contact','stable','upper','gait','collision','joint','consistent','walking','velocity'],default='contact')
+    p.add_argument('--controller',choices=['contact','stable','upper','gait','collision','joint','consistent','walking','velocity','rollout'],default='contact')
+    p.add_argument('--event-slots',type=int,default=0,help='Rollout event capacity; 0 derives it from accepted samples')
     p.add_argument('--body-goal',action='store_true',
                    help='Add body movement direction and relative heading to the v6 contact policy')
     p.add_argument('--event-stage2',action='store_true',
@@ -103,8 +104,11 @@ def main():
     if profile.event_stage2 or profile.next_contact_stage2:
         p.set_defaults(lr=1e-4,pi_lr_mult=.5)
     args=p.parse_args()
-    if args.profile == 'wbc' and args.controller != 'collision':
-        p.error('--profile wbc uses the v6 collision controller')
+    rollout = args.controller == 'rollout'
+    if args.profile == 'wbc' and not (args.controller == 'collision' or rollout):
+        p.error('--profile wbc requires the collision or rollout controller')
+    if args.event_slots < 0 or (args.event_slots and not rollout):
+        p.error('--event-slots requires the rollout controller and a nonnegative count')
     if args.body_goal and args.controller != 'collision':
         p.error('--body-goal requires --controller collision')
     next_contact = args.next_contact or args.next_contact_stage2
@@ -149,14 +153,14 @@ def main():
         p.error('Joint fine tuning needs Adam and either --resume or --init <v6> --planner-init <offline planner>')
     if not math.isfinite(args.planner_lr_mult) or args.planner_lr_mult<=0 or not 0<=args.planner_mix_start<=1 or args.planner_mix_iters<1:
         p.error('Invalid planner LR multiplier or mixing schedule')
-    if args.upper_supervision_weight is not None and (args.controller not in ('upper','gait','collision','joint','consistent') or not math.isfinite(args.upper_supervision_weight) or args.upper_supervision_weight<0):
+    if args.upper_supervision_weight is not None and (args.controller not in ('upper','gait','collision','joint','consistent','rollout') or not math.isfinite(args.upper_supervision_weight) or args.upper_supervision_weight<0):
         p.error('--upper-supervision-weight requires --controller upper/gait/collision and a finite nonnegative value')
     gait_options=('leg_pose_weight','leg_velocity_weight','stance_tilt_weight','motion_style_weight')
     for name in gait_options:
         value=getattr(args,name)
-        if value is not None and (args.controller not in ('gait','collision','joint','consistent') or not math.isfinite(value) or value<0):
+        if value is not None and (args.controller not in ('gait','collision','joint','consistent','rollout') or not math.isfinite(value) or value<0):
             p.error('--'+name.replace('_','-')+' requires --controller gait/collision and a finite nonnegative value')
-    if args.self_collision_weight is not None and (args.controller not in ('collision','joint','consistent') or not math.isfinite(args.self_collision_weight) or args.self_collision_weight<0):
+    if args.self_collision_weight is not None and (args.controller not in ('collision','joint','consistent','rollout') or not math.isfinite(args.self_collision_weight) or args.self_collision_weight<0):
         p.error('--self-collision-weight requires --controller collision and a finite nonnegative value')
     os.environ['ACP_ROBOT']='roban'
     os.environ.setdefault('MUJOCO_GL','egl')
@@ -166,7 +170,7 @@ def main():
     from .models import FastBodyGoalTask,FastNextContactTask
     from .core import Updates,CudaUpdate
     from ..backend import backend_for_format,CONTACT_FORMAT,STABLE_CONTACT_FORMAT,UPPER_SUPERVISED_FORMAT,GAIT_STYLE_FORMAT,LEG_COLLISION_FORMAT,JOINT_FORMAT,CONSISTENT_FORMAT,WALKING_FORMAT,VELOCITY_FORMAT
-    from ..backend import BODY_GOAL_FORMAT,NEXT_CONTACT_FORMAT
+    from ..backend import BODY_GOAL_FORMAT,NEXT_CONTACT_FORMAT,ROLLOUT_FORMAT
     from ..data import KINEMATIC_REFERENCE,prepare,split_clips
     from ..reference import FootstepMotion
     from ..env import FootstepTrackingSim
@@ -188,13 +192,27 @@ def main():
     formats = dict(contact=CONTACT_FORMAT,stable=STABLE_CONTACT_FORMAT,upper=UPPER_SUPERVISED_FORMAT,
                    gait=GAIT_STYLE_FORMAT,collision=LEG_COLLISION_FORMAT,joint=JOINT_FORMAT,
                    consistent=CONSISTENT_FORMAT,walking=WALKING_FORMAT,velocity=VELOCITY_FORMAT)
-    backend=backend_for_format(NEXT_CONTACT_FORMAT if next_contact else BODY_GOAL_FORMAT if args.body_goal else formats[args.controller])
-    clips=prepare(args.data,args.cache_dir)
-    if any(c.get("reference_schema") == KINEMATIC_REFERENCE for c in clips) and (not next_contact or event_stage):
-        p.error('Kinematic reference clips are supported by next-contact Stage 1')
-    split=split_clips(clips,args.val_fraction,args.seed)
     config=dict(hist=args.hist,horizons=args.horizons,wm_hidden=args.wm_hidden,policy_hidden=args.policy_hidden,
                 structured_wm=args.structured_wm)
+    policy_kwargs = {}
+    if rollout:
+        from ..rollout_controller import EVENT_FIELDS, RolloutMotion, rollout_clips, split_rollouts
+
+        clips = rollout_clips(args.data, args.horizon + 2)
+        required = max(clip['event_slots'] for clip in clips)
+        slots = args.event_slots or max(1, required)
+        if slots < required:
+            p.error(f'--event-slots needs at least {required} slots for these data')
+        config['event_slots'] = slots
+        policy_kwargs['event_slots'] = slots
+        backend = backend_for_format(ROLLOUT_FORMAT, event_slots=slots)
+        split = split_rollouts(clips, args.val_fraction, args.seed)
+    else:
+        backend=backend_for_format(NEXT_CONTACT_FORMAT if next_contact else BODY_GOAL_FORMAT if args.body_goal else formats[args.controller])
+        clips=prepare(args.data,args.cache_dir)
+        if any(c.get("reference_schema") == KINEMATIC_REFERENCE for c in clips) and (not next_contact or event_stage):
+            p.error('Kinematic reference clips are supported by next-contact Stage 1')
+        split=split_clips(clips,args.val_fraction,args.seed)
     checkpoint=None
     init_v3=False
     init_v4=False
@@ -254,17 +272,34 @@ def main():
         expected={c['fingerprint'] for v in checkpoint['split'].values() for c in v}
         if not args.init_new_reference:
             if set(current)!=expected:raise ValueError('Checkpoint datasets changed')
-            split={k:[dict(c,cache=current[c['fingerprint']]['cache']) for c in v] for k,v in checkpoint['split'].items()}
+            if rollout:
+                split = {k: [current[c['fingerprint']] for c in v] for k, v in checkpoint['split'].items()}
+            else:
+                split={k:[dict(c,cache=current[c['fingerprint']]['cache']) for c in v] for k,v in checkpoint['split'].items()}
     if not split['train'] or not split['val']:
         raise ValueError('Reference requires nonempty training and validation clips')
     kin=FastKinematics(dev)
-    motion=FootstepMotion(split['train'],kin,dev,args.horizons,args.max_clips,
-                          reserve_steps=getattr(backend,'reserve_steps',0))
+    if rollout:
+        train_parts = split['train'][:args.max_clips] if args.max_clips else split['train']
+        if not any(clip['event_slots'] for clip in train_parts):
+            raise ValueError('The training split has no observed touchdown events')
+        motion = RolloutMotion(train_parts, kin, dev, slots)
+    else:
+        motion=FootstepMotion(split['train'],kin,dev,args.horizons,args.max_clips,
+                              reserve_steps=getattr(backend,'reserve_steps',0))
     if int(motion.clip_len.min())<=args.horizon+1:raise ValueError('Reference blocks too short')
     if bool(motion.clip_boxes.any()):raise ValueError('Fast flat-ground specialization only')
     geometry=max(r['max_m'] for r in motion.geometry_reports)
     if geometry>.05:raise ValueError('Capture/training FK differs by over 5cm')
-    task_cls=dict(contact=FastContactTask,stable=FastStableContactTask,upper=FastUpperSupervisedTask,gait=FastGaitStyleTask,collision=FastLegCollisionTask,joint=FastJointTask,consistent=FastConsistentJointTask,walking=FastWalkingPlannerTask,velocity=FastVelocityTask)[args.controller]
+    if rollout:
+        from .models import Geometry
+
+        class FastRolloutTask(Geometry, backend.Task):
+            pass
+
+        task_cls = FastRolloutTask
+    else:
+        task_cls=dict(contact=FastContactTask,stable=FastStableContactTask,upper=FastUpperSupervisedTask,gait=FastGaitStyleTask,collision=FastLegCollisionTask,joint=FastJointTask,consistent=FastConsistentJointTask,walking=FastWalkingPlannerTask,velocity=FastVelocityTask)[args.controller]
     if args.body_goal:
         task_cls = FastBodyGoalTask
     if next_contact:
@@ -287,7 +322,9 @@ def main():
     task=task_cls(motion,kin,reward_cfg)
     mdp=backend.MDP(kin,motion,torch.tensor(default_joint_pos_list(),device=dev),task)
     mdp.scan=lambda S,boxes:flat_scan(S,mdp.scan_dim)
-    policy=device_norms(backend.Policy(args.hist,args.policy_hidden,**(dict(planner_config=planner_config) if joint else {})).to(dev))
+    if joint:
+        policy_kwargs['planner_config'] = planner_config
+    policy=device_norms(backend.Policy(args.hist,args.policy_hidden,**policy_kwargs).to(dev))
     wm=FastWorldModel(mdp.scan_dim,args.wm_hidden,args.structured_wm,args.amp=='bf16').to(dev)
     critic=device_norms(Critic(getattr(mdp,'critic_input_dim',INV_DIM+mdp.critic_extra+backend.command_dim)).to(dev))
     event = None
@@ -319,7 +356,7 @@ def main():
             return MuonAdam(model,hidden,lr=lr,betas=betas,fused=True,capturable=True)
         return torch.optim.Adam(model.parameters(),lr=torch.tensor(lr,device=dev),betas=betas,fused=True,capturable=True)
     pi_hidden=[policy.enc,policy.dec]
-    if args.controller in ('upper','gait','collision'):pi_hidden.extend([policy.upper_enc,policy.upper_dec])
+    if args.controller in ('upper','gait','collision','rollout'):pi_hidden.extend([policy.upper_enc,policy.upper_dec])
     ow=opt(wm,args.lr,[wm.net]);ov=opt(critic,args.lr)
     if joint:
         groups=[dict(params=[v for k,v in policy.named_parameters() if v.requires_grad and not k.startswith('planner.')],
@@ -396,7 +433,8 @@ def main():
     if any(reset_shares):
         from ...blink_reset_sampling import BlinkResetCfg
         reset_cfg = BlinkResetCfg(*reset_shares)
-    env = env_cls(args.num_envs,motion,mdp,dev,gamma=args.gamma,reset_noise=args.reset_noise,blink_reset=reset_cfg)
+    env = env_cls(args.num_envs,motion,mdp,dev,gamma=args.gamma,reset_noise=args.reset_noise,blink_reset=reset_cfg,
+                  reference_reset_action=rollout)
     if event is not None and not next_contact:
         due_plans = DuePlans(event,args.num_envs,dev)
     sampler = env.blink_sampler
@@ -515,6 +553,9 @@ def main():
                      train_frames=motion.num_frames,geometry_max_m=geometry,robot=metadata())
     if joint:task_report.update(controller_command_dim=13,planner_command_dim=4,joint_mode='fixed_controller' if walking else 'planner_and_controller')
     if consistent:task_report.update(future_realization_constraints=True,flat_ground_projection=True)
+    if rollout:
+        task_report.update(stage='rollout_oracle_timed_contacts', event_window_s=1.5, event_fields=EVENT_FIELDS,
+                           style_reference='measured_rollout', velocity_enters_controller=False)
     if next_contact:
         task_report.update(stage='acp_next_contact_joint' if event is not None else 'acp_next_contact_reference',
                            controller_command_dim=backend.command_dim,event_window_s=1.5)
@@ -557,8 +598,9 @@ def main():
     joint_active=updates.joint_supervision is not None
     trajectory_active=updates.trajectory_supervision is not None
     gait_columns=(['leg_pose_cost','leg_velocity_cost','pelvis_tilt_cost','stance_tilt_cost','knee_cost',
-                   'contact_reward','position_reward','yaw_reward'] if args.controller in ('gait','collision') else [])
-    if args.controller=='collision':gait_columns.extend(['self_collision_cost','min_leg_clearance_m','leg_proxy_overlap_fraction'])
+                   'contact_reward','position_reward','yaw_reward'] if args.controller in ('gait','collision','rollout') else [])
+    if args.controller in ('collision','rollout'):gait_columns.extend(['self_collision_cost','min_leg_clearance_m','leg_proxy_overlap_fraction'])
+    if rollout:gait_columns.extend(['slip_cost','impact_cost'])
     if joint:gait_columns=['leg_pose_cost','leg_velocity_cost','pelvis_tilt_cost','stance_tilt_cost','knee_cost',
                           'self_collision_cost','min_leg_clearance_m','leg_proxy_overlap_fraction',
                           'velocity_error_mps','yaw_rate_error_rps','velocity_reward','yaw_velocity_reward']
@@ -638,7 +680,8 @@ def main():
                     with torch.random.fork_rng(devices=[torch.device(dev)]):
                         if probe_env is None:
                             probe_mdp = backend.MDP(kin,motion,mdp.default_q,task)
-                            probe_env = env_cls(args.probe_envs,motion,probe_mdp,dev,eval_mode=True,reset_noise=False)
+                            probe_env = env_cls(args.probe_envs,motion,probe_mdp,dev,eval_mode=True,reset_noise=False,
+                                                reference_reset_action=rollout)
                             probe_env.max_episode_steps = env.max_episode_steps
                         failed = probe_failures(probe_env,updates.average,task)
                     sampler.set_focus(failed,preceding_bins=2)

@@ -5,12 +5,14 @@ import math
 import mujoco
 import numpy as np
 import torch
+from scipy.spatial import ConvexHull
 
 from .gait_style import GaitStyleCfg, GaitStyleTask, GaitStyleMDP, GaitStylePolicy
 from .env import FootstepTrackingSim
 from ..env import make_scene_cfg
 from ..motion import CONTROL_DT
 from ..robot import get_spec
+from ..self_collision import hull_vertices
 
 
 def collision_spec():
@@ -63,10 +65,10 @@ def segment_distance(a, b, c, d):
 
 
 class LegCollisionGeometry:
-    """Exact capsule proxies; conservative covering spheres for thin foot solids.
+    """Capsules and spheres for opposite-leg proximity, including mesh assets.
 
     Proxies affect only the differentiable reward. Physics retains the original
-    capsules, cylinders and boxes, with opposite-leg collision masks enabled.
+    collision geoms, with opposite-leg collision masks enabled.
     """
     def __init__(self, kin, device):
         model = get_spec().compile()
@@ -91,6 +93,19 @@ class LegCollisionGeometry:
                 for x in np.linspace(-size[axis]+half,size[axis]-half,3):
                     p=center+R[:,axis]*x
                     proxies[side].append((owner,p,p,radius))
+            elif kind == mujoco.mjtGeom.mjGEOM_MESH:
+                vertices = hull_vertices(model, g)
+                hull = ConvexHull(vertices)
+                extent = np.ptp(vertices, axis=0)
+                axis = extent.argmax()
+                middle = vertices[hull.vertices].mean(0)
+                for fraction in (-.25, 0., .25):
+                    point = middle.copy()
+                    point[axis] += fraction * extent[axis]
+                    radius = -(hull.equations[:, :3] @ point + hull.equations[:, 3]).max()
+                    if radius > .002:
+                        world = center + R @ point
+                        proxies[side].append((owner, world, world, float(radius)))
             else:raise ValueError('Unsupported leg collision primitive '+str(kind))
         self.kin=kin
         for side,items in proxies.items():

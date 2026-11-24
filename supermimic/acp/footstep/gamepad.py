@@ -15,6 +15,7 @@ class Gamepad:
     _SUBSYSTEM = 0x2000  # SDL_INIT_GAMEPAD
     _LEFT_SHOULDER = 9
     _RIGHT_SHOULDER = 10  # SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER
+    _START = 6
     _LEFT_TRIGGER = 4
     _RIGHT_TRIGGER = 5
 
@@ -46,6 +47,7 @@ class Gamepad:
             raise RuntimeError(self.sdl.SDL_GetError().decode())
         self.handle = None
         self.a_pressed = True  # A must be released before it can reset.
+        self.start_pressed = True
         try:
             deadline = time.monotonic() + wait
             while not self.handle:
@@ -86,6 +88,12 @@ class Gamepad:
 
     def run_pressed(self):
         return self.sdl.SDL_GetGamepadButton(self.handle, self._RIGHT_SHOULDER)
+
+    def start_edge(self):
+        pressed = self.sdl.SDL_GetGamepadButton(self.handle, self._START)
+        edge = pressed and not self.start_pressed
+        self.start_pressed = pressed
+        return edge
 
     def motion_matching_buttons(self):
         walk = self.a_pressed  # South button, sampled by read().
