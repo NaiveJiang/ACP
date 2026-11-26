@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from ..rotations import mat_to_6d, yaw_mat
-from .mdp import OBS_DIM
+from .mdp import OBS_DIM, root_frame_vectors
 from .networks import Policy
 from .robot import JOINT_NAMES, NUM_J, action_scale
 from .s17_actuation import ACTION_SCALE as S17_ACTION_SCALE
@@ -19,8 +19,12 @@ class ReferenceCfg:
     root_reference: str = "world"
 
     def __post_init__(self):
-        if self.root_reference not in ("world", "local"):
-            raise ValueError("root_reference must be world or local")
+        if self.root_reference not in ("world", "local", "body-heading"):
+            raise ValueError("root_reference must be world, local or body-heading")
+
+    @property
+    def body_reference(self):
+        return self.root_reference == "body-heading"
 
 
 class ReferenceTask:
@@ -30,6 +34,10 @@ class ReferenceTask:
             (-0.4, 0.4, 9), (-0.3, 0.3, 7), device=mdp.default_q.device
         )
         self.frame_dim = 15 + 2 * NUM_J
+        self.joint_goal_offset = 15
+        if cfg.body_reference:
+            self.joint_goal_offset = 12
+            self.frame_dim = self.joint_goal_offset + 2 * NUM_J + 3 * len(mdp.kin.tracked_idx)
         self.cmd_dim = len(cfg.offsets) * self.frame_dim + len(self.scan_offsets)
         self.offsets = torch.tensor(cfg.offsets, device=mdp.default_q.device)
 
@@ -45,12 +53,21 @@ class ReferenceTask:
         )
         window = (motion.root_p[future], motion.root_R[future], motion.root_v[future],
                   motion.root_w[future], motion.q[future], motion.qd[future])
+        if self.cfg.body_reference:
+            p, R, v, w, q, qd = window
+            body = root_frame_vectors(R, motion.body_p[future] - p.unsqueeze(-2))
+            return self.body_command(state, (R, v, w, q, qd), body, motion.boxes(frames, variants))
         anchor = (motion.root_p[frames], motion.root_R[frames]) if self.cfg.root_reference == "local" else None
         return self.command_from_reference(state, window, motion.boxes(frames, variants), anchor=anchor)
 
     def command_from_reference(self, state, window, boxes, *, anchor=None):
         """Encode an externally planned window in the same order as training."""
         root_position, root_rotation, linear_velocity, angular_velocity, joint_position, joint_velocity = window
+        if self.cfg.body_reference:
+            zeros = torch.zeros_like(linear_velocity)
+            identity = torch.eye(3, device=zeros.device, dtype=zeros.dtype).expand_as(root_rotation)
+            body = self.mdp.kin.forward(zeros, identity, zeros, zeros, joint_position, joint_velocity)[0]
+            return self.body_command(state, window[1:], body, boxes)
         if self.cfg.root_reference == "local":
             if anchor is None:
                 raise ValueError("Local reference conditioning requires the current reference pose")
@@ -76,10 +93,17 @@ class ReferenceTask:
             ),
             -1,
         ).flatten(1)
-        scan = height_scan(
-            state[0], state[1], boxes, self.scan_offsets
-        )
-        return torch.cat((reference, scan), -1)
+        return torch.cat((reference, height_scan(state[0], state[1], boxes, self.scan_offsets)), -1)
+
+    def body_command(self, state, window, body, boxes):
+        rotation, velocity, angular, q, qd = window
+        orientation_error = mat_to_6d(state[1].transpose(-1, -2)[:, None] @ rotation)
+        inverse = rotation.transpose(-1, -2)
+        local_velocity = (inverse @ velocity.unsqueeze(-1)).squeeze(-1)
+        local_angular = (inverse @ angular.unsqueeze(-1)).squeeze(-1)
+        reference = torch.cat((orientation_error, local_velocity, local_angular, q, qd, body.flatten(-2)), -1)
+        scan = height_scan(state[0], state[1], boxes, self.scan_offsets)
+        return torch.cat((reference.flatten(1), scan), -1)
 
     def critic_input(self, state, frames, variants, goal_steps, context):
         return torch.cat(
@@ -104,9 +128,11 @@ class ReferencePolicy(Policy):
         hist=10,
         reference_action_skip=True,
         s17_actuators=False,
+        joint_goal_offset=15,
     ):
         super().__init__(obs_dim, goal_dim, hist)
         self.reference_action_skip = reference_action_skip
+        self.joint_goal_offset = joint_goal_offset
         scale = (
             torch.full_like(default_q, S17_ACTION_SCALE)
             if s17_actuators
@@ -126,9 +152,10 @@ class ReferencePolicy(Policy):
     def forward(self, history, goal):
         action = super().forward(history, goal)
         if self.reference_action_skip:
+            start = self.joint_goal_offset
             action = (
                 action
-                + (goal[:, 15 : 15 + NUM_J] - self.reference_default)
+                + (goal[:, start : start + NUM_J] - self.reference_default)
                 / self.reference_scale
             )
         return self.project_action(action)
@@ -144,6 +171,7 @@ def build_policy(mdp, task, hist):
         hist,
         task.cfg.reference_action_skip,
         s17_actuators=bool(mdp.delay_steps),
+        joint_goal_offset=task.joint_goal_offset,
     )
 
 

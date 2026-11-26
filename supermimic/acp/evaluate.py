@@ -153,7 +153,8 @@ mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev),
           RewardCfg(term_window=int(round(term_win / CONTROL_DT)),
                     w_knee_tracking=a_.get("knee_tracking_weight", 0.0),
                     w_self_collision=a_.get("self_collision_weight", 0.0),
-                    local_reference_root=local_reference_root),
+                    local_reference_root=local_reference_root,
+                    body_reference=reference_cfg is not None and reference_cfg.body_reference),
           independent_surface_friction=friction_override, delay_steps=delay_steps)
 ctc = (ReferenceTask(reference_cfg, mdp) if reference_task
        else ContactTask(ContactCfg(**ck["ctc_cfg"]), mdp, motion_dir, dev))

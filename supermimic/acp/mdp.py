@@ -45,6 +45,8 @@ class RewardCfg:
     w_knee_tracking: float = 0.0
     w_self_collision: float = 0.0
     local_reference_root: bool = False
+    body_reference: bool = False
+    body_reference_min_height: float = 0.10
     soft_limit_factor: float = SOFT_JOINT_LIMIT_FACTOR
     term_height: float = 0.25
     term_tilt: float = 0.8
@@ -73,6 +75,10 @@ def invariant_features(S) -> torch.Tensor:
 
 
 INV_DIM = 1 + 6 + 3 + 3 + NUM_J + NUM_J
+
+
+def root_frame_vectors(rotation, vectors):
+    return (rotation.transpose(-1, -2).unsqueeze(-3) @ vectors.unsqueeze(-1)).squeeze(-1)
 
 
 def normalize_xi(xi: torch.Tensor, delay_steps: int = 0) -> torch.Tensor:
@@ -104,7 +110,8 @@ class MDP:
         self.surface_context_dim = XI_DIM + int(independent_surface_friction)
         self.delay_steps = delay_steps
         self.context_dim = self.surface_context_dim + delay_steps * NUM_J
-        self.critic_extra = NUM_J + len(kin.tracked_idx) * 3 + 3 + 6 + self.context_dim + self.scan_dim
+        root_position_dims = 0 if cfg.body_reference else 3
+        self.critic_extra = NUM_J + len(kin.tracked_idx) * 3 + root_position_dims + 6 + self.context_dim + self.scan_dim
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi) -> torch.Tensor:
@@ -142,26 +149,39 @@ class MDP:
             bp, bR = bp_all[..., ids, :], bR_all[..., ids, :, :]
             bv, bw = bv_all[..., ids, :], bw_all[..., ids, :]
         rp, rR = m.root_p[f], m.root_R[f]
-        # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
-        local_root = c.local_reference_root
-        dR = (yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2) if local_root
-              else yaw_mat(R @ rR.transpose(-1, -2)))
-        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
-        ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
-        e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
-        e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        ref_v, ref_w = m.body_v[f], m.body_w[f]
-        if local_root:
-            ref_v = (dR.unsqueeze(-3) @ ref_v.unsqueeze(-1)).squeeze(-1)
-            ref_w = (dR.unsqueeze(-3) @ ref_w.unsqueeze(-1)).squeeze(-1)
-        e_lv = ((ref_v - bv) ** 2).sum(-1).mean(-1)
-        e_av = ((ref_w - bw) ** 2).sum(-1).mean(-1)
-        e_rp = ((anchor - p if local_root else rp - p) ** 2).sum(-1)
-        e_ro = rot_angle_sq(dR @ rR if local_root else rR, R)
-        r_track = (torch.exp(-e_pos / c.body_pos_std**2) + torch.exp(-e_ori / c.body_ori_std**2) + torch.exp(-e_lv / c.body_linvel_std**2)
-                   + torch.exp(-e_av / c.body_angvel_std**2) + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
-                   + 0.5 * torch.exp(-e_ro / c.root_ori_std**2))  # fmt: skip
+        if c.body_reference:
+            e_pos = (root_frame_vectors(rR, m.body_p[f] - rp.unsqueeze(-2))
+                     - root_frame_vectors(R, bp - p.unsqueeze(-2))).square().sum(-1).mean(-1)
+            e_ori = rot_angle_sq(rR.transpose(-1, -2).unsqueeze(-3) @ m.body_R[f],
+                                 R.transpose(-1, -2).unsqueeze(-3) @ bR).mean(-1)
+            e_lv = (root_frame_vectors(rR, m.body_v[f]) - root_frame_vectors(R, bv)).square().sum(-1).mean(-1)
+            e_av = (root_frame_vectors(rR, m.body_w[f]) - root_frame_vectors(R, bw)).square().sum(-1).mean(-1)
+            yaw, ref_yaw = yaw_mat(R), yaw_mat(rR)
+            heading_cosine = (yaw[..., :2, 0] * ref_yaw[..., :2, 0]).sum(-1).clamp(-1., 1.)
+            tilt_error = rot_angle_sq(ref_yaw.transpose(-1, -2) @ rR, yaw.transpose(-1, -2) @ R)
+            root_track = 0.5 * (1. + heading_cosine) * torch.exp(-tilt_error / c.root_ori_std**2)
+        else:
+            # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
+            local_root = c.local_reference_root
+            dR = (yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2) if local_root
+                  else yaw_mat(R @ rR.transpose(-1, -2)))
+            anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
+            ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+            ref_bR = dR.unsqueeze(-3) @ m.body_R[f]
+            e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
+            e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
+            ref_v, ref_w = m.body_v[f], m.body_w[f]
+            if local_root:
+                ref_v = (dR.unsqueeze(-3) @ ref_v.unsqueeze(-1)).squeeze(-1)
+                ref_w = (dR.unsqueeze(-3) @ ref_w.unsqueeze(-1)).squeeze(-1)
+            e_lv = ((ref_v - bv) ** 2).sum(-1).mean(-1)
+            e_av = ((ref_w - bw) ** 2).sum(-1).mean(-1)
+            e_rp = ((anchor - p if local_root else rp - p) ** 2).sum(-1)
+            e_ro = rot_angle_sq(dR @ rR if local_root else rR, R)
+            root_track = 0.5 * torch.exp(-e_rp / c.root_pos_std**2) + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
+        r_track = (torch.exp(-e_pos / c.body_pos_std**2) + torch.exp(-e_ori / c.body_ori_std**2)
+                   + torch.exp(-e_lv / c.body_linvel_std**2) + torch.exp(-e_av / c.body_angvel_std**2)
+                   + root_track)
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
         if self.knee_ids is not None:
@@ -182,28 +202,36 @@ class MDP:
         m, W = self.motion, self.cfg.term_window
         c = m.clip_id[f]
         g = (f.unsqueeze(-1) + torch.arange(-W, W + 1, device=f.device)).clamp(m.clip_start[c].unsqueeze(-1), m.clip_end[c].unsqueeze(-1))
-        e_z = (m.root_p[:, 2][g] - p[..., 2:3].detach()).abs() / self.cfg.term_height
         e_tilt = (m.root_R[:, 2, 2][g] - R[..., 2, 2:3].detach()).abs() / self.cfg.term_tilt
+        if self.cfg.body_reference:
+            return g.gather(-1, e_tilt.argmin(-1, keepdim=True)).squeeze(-1)
+        e_z = (m.root_p[:, 2][g] - p[..., 2:3].detach()).abs() / self.cfg.term_height
         return g.gather(-1, torch.maximum(e_z, e_tilt).argmin(-1, keepdim=True)).squeeze(-1)
+
+    def fall_height_margin(self, p, f):
+        if self.cfg.body_reference:
+            # Flat ground: use a measured pelvis-height floor independently of reference translation.
+            return self.cfg.body_reference_min_height - p[..., 2]
+        return (self.motion.root_p[f][..., 2] - p[..., 2]).abs() - self.cfg.term_height
 
     def termination(self, S, f) -> torch.Tensor:
         p, R = S[0], S[1]
         if self.cfg.term_window:
             f = self.best_frame(p, R, f)
-        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
-        e_z = (rp[..., 2] - p[..., 2]).abs()
+        rR = self.motion.root_R[f]
+        e_z = self.fall_height_margin(p, f)
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
-        return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
+        return (e_z > 0.) | (e_tilt > self.cfg.term_tilt)
 
     def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
         """Differentiable termination probability for imagined rollouts (at the best frame of the window)."""
         p, R = S[0], S[1]
         if self.cfg.term_window:
             f = self.best_frame(p, R, f)
-        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
-        e_z = (rp[..., 2] - p[..., 2]).abs()
+        rR = self.motion.root_R[f]
+        e_z = self.fall_height_margin(p, f)
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
-        alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
+        alive = (1 - torch.sigmoid(e_z / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
         return 1 - alive
 
     def critic_features(self, S, f, xi_n, boxes) -> torch.Tensor:
@@ -213,6 +241,11 @@ class MDP:
         Ht = yaw_mat(R).transpose(-1, -2)
         rp, rR = m.root_p[f], m.root_R[f]
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
+        if self.cfg.body_reference:
+            e_body = (root_frame_vectors(rR, m.body_p[f] - rp.unsqueeze(-2))
+                      - root_frame_vectors(R, bp - p.unsqueeze(-2))).flatten(-2)
+            rel = mat_to_6d(R.transpose(-1, -2) @ rR)
+            return torch.cat((invariant_features(S), m.q[f] - q, e_body, rel, xi_n, self.scan(S, boxes)), -1)
         local_root = self.cfg.local_reference_root
         dR = (yaw_mat(R) @ yaw_mat(rR).transpose(-1, -2) if local_root
               else yaw_mat(R @ rR.transpose(-1, -2)))

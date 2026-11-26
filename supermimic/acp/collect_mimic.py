@@ -37,6 +37,8 @@ def success_reasons(
     reference,
     position_tolerance=0.3,
     height_tolerance=0.15,
+    *,
+    track_translation=True,
 ):
     reasons = []
     if not valid:
@@ -45,9 +47,9 @@ def success_reasons(
         reasons.append("tracking_termination")
     if not completed:
         reasons.append("incomplete_clip")
-    if np.linalg.norm(final[:2] - reference[:2]) > position_tolerance:
+    if track_translation and np.linalg.norm(final[:2] - reference[:2]) > position_tolerance:
         reasons.append("final_xy_error")
-    if abs(final[2] - reference[2]) > height_tolerance:
+    if track_translation and abs(final[2] - reference[2]) > height_tolerance:
         reasons.append("final_height_error")
     final_rotation = quat_to_mat(torch.tensor(final[3:7])).numpy()
     reference_rotation = quat_to_mat(torch.tensor(reference[3:7])).numpy()
@@ -224,7 +226,8 @@ def collect(args):
     primitive_soles = checkpoint["args"].get("primitive_soles", False)
     mdp = MDP(
         kin, motion, torch.tensor(default_joint_pos_list(), device=args.device),
-        RewardCfg(w_self_collision=self_collision_weight, local_reference_root=cfg.root_reference == "local"),
+        RewardCfg(w_self_collision=self_collision_weight, local_reference_root=cfg.root_reference == "local",
+                  body_reference=cfg.body_reference),
         independent_surface_friction=ground is not None, delay_steps=delay_steps,
     )
     task = ReferenceTask(cfg, mdp)
@@ -341,6 +344,7 @@ def collect(args):
                 reference_frames[-1] == end,
                 states[-1, :7],
                 final_reference,
+                track_translation=not cfg.body_reference,
             )
             joint_error = float(
                 np.sqrt(

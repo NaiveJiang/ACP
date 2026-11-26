@@ -214,7 +214,7 @@ def main():
     parser.add_argument("--projector-lr", type=float, default=1e-5)
     parser.add_argument("--ema-decay", type=float, default=.95)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--root-reference", choices=("local", "world"), default="local")
+    parser.add_argument("--root-reference", choices=("local", "world", "body-heading"), default="local")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     scalars = (args.seconds, args.ctrl_noise, args.projector_noise, args.ctrl_lr, args.projector_lr)

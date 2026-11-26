@@ -44,12 +44,12 @@ class HeadingCommand:
     drive: tuple[float, float]
     heading: float | None
     turn_speed: float
+    half_turn_sign: float = 1.
 
     def resolve(self, facing):
         error = 0. if self.heading is None else math.remainder(self.heading - facing, math.tau)
-        # Either direction is valid for the exact half turn. Pick a deterministic side.
         if abs(abs(error) - math.pi) < 1e-6:
-            error = math.pi
+            error = math.copysign(math.pi, self.half_turn_sign)
         turn = np.clip(5. * error, -self.turn_speed, self.turn_speed)
         return np.array([*self.drive, turn]), error
 
@@ -71,6 +71,24 @@ class HeadingCommand:
             acceleration = decay * (acceleration - slope * rate * dt)
             result.append(position)
         return np.stack(result), planar_heading(yaw)
+
+
+@dataclass(frozen=True)
+class BoundedHeadingCommand(HeadingCommand):
+    """A finite turn relative to the continuous heading shared at reset."""
+
+    def resolve(self, facing):
+        error = self.heading - facing
+        turn = np.clip(5. * error, -self.turn_speed, self.turn_speed)
+        return np.array([*self.drive, turn]), error
+
+    def trajectory(self, error, velocity, yaw_rate):
+        turn = np.clip(5. * error, -self.turn_speed, self.turn_speed)
+        duration = np.minimum(LOOKAHEAD, abs(error) / max(abs(turn), 1e-9))
+        angles = turn * duration
+        arc, direction = command_trajectory((*self.drive, turn), times=duration)
+        position = arc + (LOOKAHEAD - duration)[:, None] * rotate(self.drive, angles)
+        return position, direction
 
 
 class LearnedPlayback:
@@ -173,7 +191,10 @@ class LearnedPlayback:
             _, local_velocity, rate = self.pose_and_velocity(state)
         else:
             local_velocity, rate = root_velocity
-        next_yaw = state.yaw + rate/self.fps
+        angle = rate / self.fps
+        if isinstance(intent, BoundedHeadingCommand):
+            angle = float(np.clip(angle, min(0., error), max(0., error)))
+        next_yaw = state.yaw + angle
         xy = state.xy + rotate(local_velocity, .5*(state.yaw+next_yaw))/self.fps
         outgoing = state.outgoing
         blend_tick = state.blend_tick+1 if outgoing is not None else 0

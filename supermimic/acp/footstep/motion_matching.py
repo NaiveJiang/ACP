@@ -43,12 +43,12 @@ def planar_heading(angle):
     return rotate(np.broadcast_to([1., 0.], (*np.shape(angle), 2)), angle)
 
 
-def command_trajectory(command):
+def command_trajectory(command, *, times=LOOKAHEAD):
     vx, vy, wz = np.moveaxis(np.asarray(command)[..., None, :], -1, 0)
-    angles = wz * LOOKAHEAD
+    angles = wz * times
     # Exact integration of a constant velocity in the turning base frame.
-    along = LOOKAHEAD * np.sinc(angles / np.pi)
-    across = .5 * LOOKAHEAD * angles * np.sinc(angles / (2*np.pi))**2
+    along = times * np.sinc(angles / np.pi)
+    across = .5 * times * angles * np.sinc(angles / (2*np.pi))**2
     return np.stack((along*vx-across*vy, across*vx+along*vy), -1), planar_heading(angles)
 
 

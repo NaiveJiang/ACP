@@ -16,6 +16,9 @@ class Gamepad:
     _LEFT_SHOULDER = 9
     _RIGHT_SHOULDER = 10  # SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER
     _START = 6
+    _DPAD_DOWN = 12
+    _DPAD_LEFT = 13
+    _DPAD_RIGHT = 14
     _LEFT_TRIGGER = 4
     _RIGHT_TRIGGER = 5
 
@@ -104,6 +107,13 @@ class Gamepad:
 
     def hold_heading_pressed(self):
         return self.sdl.SDL_GetGamepadAxis(self.handle, self._LEFT_TRIGGER) > .425*32767
+
+    def turning_inputs(self):
+        dpad = tuple(self.sdl.SDL_GetGamepadButton(self.handle, button)
+                     for button in (self._DPAD_LEFT, self._DPAD_RIGHT, self._DPAD_DOWN))
+        triggers = tuple(max(0, self.sdl.SDL_GetGamepadAxis(self.handle, axis)) / 32767.
+                         for axis in (self._LEFT_TRIGGER, self._RIGHT_TRIGGER))
+        return dpad, triggers
 
     def close(self):
         if self.handle:

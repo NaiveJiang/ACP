@@ -2,7 +2,7 @@
 
 import argparse
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import signal
@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from .gamepad import Gamepad
-from .learned_motion import HeadingCommand, LearnedPlayback, checksum
+from .learned_motion import BoundedHeadingCommand, HeadingCommand, LearnedPlayback, checksum
 from .motion_matching import Robot
 from .s17_alignment import spring_angle
 from .reference_planner import ReferencePlanner
@@ -30,7 +30,7 @@ from ...rotations import mat_to_quat, quat_to_mat, yaw_mat
 
 
 class GamepadSteering:
-    """Mirror the C++ search player's move/aim/hold rules for a learned planner."""
+    """Translate SDL stick input into motion commands for the LMM."""
 
     def __init__(self, walk_speed, run_speed, turn_speed, deadzone):
         self.walk_speed = walk_speed
@@ -44,14 +44,18 @@ class GamepadSteering:
         self.aimed = False
         self.drive_at_aim = np.zeros(2)
         self.walk = self.walk_rate = 0.
+        self.direction_basis = yaw
+        self.turning = False
 
-    def update(self, axes, *, walk, orbit, hold, camera_yaw):
-        drive, side = axes[:2]
-        shaped = np.array([drive, side])
-        shaped = np.where(np.abs(shaped) > self.deadzone, shaped * np.abs(shaped), 0.)
+    def forward_speed(self, walk):
         self.walk, self.walk_rate = spring_angle(self.walk, self.walk_rate, float(walk),
                                                   2. * math.log(2.) / .1, CONTROL_DT)
-        forward = self.run_speed + (self.walk_speed - self.run_speed) * self.walk
+        return self.run_speed + (self.walk_speed - self.run_speed) * self.walk
+
+    def update(self, axes, *, walk, orbit, hold, camera_yaw):
+        shaped = np.asarray(axes[:2])
+        shaped = np.where(np.abs(shaped) > self.deadzone, shaped * np.abs(shaped), 0.)
+        forward = self.forward_speed(walk)
         side_speed = 1.15 + (.75 - 1.15) * self.walk
         requested = shaped * [forward, side_speed] / max(1., np.abs(shaped).sum())
         speed = float(np.linalg.norm(requested))
@@ -71,6 +75,120 @@ class GamepadSteering:
                 self.heading = math.atan2(direction[1], direction[0])
         drive = tuple(requested) if hold else (speed, 0.)
         return HeadingCommand(drive, self.heading, self.turn_speed)
+
+    def update_direction_basis(self, axes, *, walk, robot_yaw):
+        """Turn in place with the right stick and latch measured yaw on release."""
+        forward = self.forward_speed(walk)
+        drive, side, turn = axes[:3]
+        if abs(turn) > self.deadzone:
+            self.turning = True
+            return np.array([0., 0., self.turn_speed * turn * abs(turn)])
+        if self.turning:
+            self.direction_basis = robot_yaw
+            self.turning = False
+        radius = math.hypot(drive, side)
+        if radius <= self.deadzone:
+            return np.zeros(3)
+        speed = forward * min(1., radius)**2
+        heading = self.direction_basis + math.atan2(side, drive)
+        return HeadingCommand((speed, 0.), math.remainder(heading, math.tau), self.turn_speed)
+
+
+class OmnidirectionalSteering(GamepadSteering):
+    trigger_threshold = .20
+    trigger_release = .15
+    turn_tolerance = math.radians(3.)
+
+    def reset(self, yaw):
+        super().reset(yaw)
+        self.last_yaw = self.yaw = yaw
+        self.target_yaw = None
+        self.completed_yaw = None
+        self.turn_origin = yaw
+        self.dpad = (False, False, False)
+        self.trigger_pressed = False
+        self.trigger_side = None
+        self.trigger_peak = 0.
+
+    def update_omnidirectional(self, axes, *, walk, robot_yaw, dpad, triggers):
+        self.yaw += math.remainder(robot_yaw - self.last_yaw, math.tau)
+        self.last_yaw = robot_yaw
+        forward = self.forward_speed(walk)
+        stick = np.asarray(axes[:2])
+        radius = np.linalg.norm(stick)
+        drive = (min(1., radius)**2 / radius * stick * [forward, 1.15 + (.75 - 1.15) * self.walk]
+                 if radius > self.deadzone else np.zeros(2))
+        manual_turn = axes[2]
+        previous_dpad, self.dpad = self.dpad, dpad
+        threshold = self.trigger_release if self.trigger_pressed else self.trigger_threshold
+        pressed = max(triggers) > threshold
+        new_trigger = pressed and not self.trigger_pressed
+        self.trigger_pressed = pressed
+
+        if abs(manual_turn) > self.deadzone:
+            self.target_yaw = None
+            self.completed_yaw = None
+            self.trigger_side = None
+            return np.r_[drive, self.turn_speed * manual_turn * abs(manual_turn)]
+        if any(dpad):
+            self.trigger_side = None
+            self.update_dpad_turn(dpad, previous_dpad)
+        else:
+            self.update_trigger_turn(triggers, new_trigger)
+        if self.target_yaw is None:
+            return np.r_[drive, 0.]
+        remaining = self.target_yaw - self.yaw
+        reached = self.turn_sign * remaining <= self.turn_tolerance
+        if reached or self.turn_ticks == 0:
+            if reached:
+                self.completed_yaw = self.target_yaw
+            self.target_yaw = None
+            return np.r_[drive, 0.]
+        self.turn_ticks -= 1
+        # Track the selected side even if a half turn starts across the yaw wrap.
+        error = float(np.clip(remaining, -math.pi, math.pi))
+        return HeadingCommand(tuple(drive), robot_yaw + error, self.turn_speed, error)
+
+    def start_turn(self, angle):
+        self.target_yaw = self.turn_origin + angle
+        self.completed_yaw = None
+        self.turn_sign = math.copysign(1., angle)
+        # Allow time to step into the turn and stop issuing it if the policy stalls.
+        self.turn_ticks = math.ceil((2. + 2. * abs(angle) / self.turn_speed) / CONTROL_DT)
+
+    def reference_command(self, command):
+        goal = self.target_yaw if self.target_yaw is not None else self.completed_yaw
+        if goal is None:
+            return command
+        drive = command.drive if isinstance(command, HeadingCommand) else tuple(command[:2])
+        return BoundedHeadingCommand(drive, goal, self.turn_speed)
+
+    def update_dpad_turn(self, buttons, previous):
+        if not any(previous):
+            self.turn_origin = self.yaw
+        if not any(now and not old for now, old in zip(buttons, previous, strict=True)):
+            return
+        left, right, down = buttons
+        side = int(left) - int(right)
+        if side or down:
+            self.start_turn(math.atan2(side, -int(down)))
+
+    def update_trigger_turn(self, triggers, new_trigger):
+        if new_trigger:
+            self.trigger_side = int(triggers[1] > triggers[0])
+            self.trigger_peak = self.trigger_threshold
+            self.turn_origin = self.yaw
+        if self.trigger_side is None:
+            return
+        amount = triggers[self.trigger_side]
+        if amount <= self.trigger_release:
+            self.trigger_side = None
+        # A held trigger can extend the turn. Small changes in its reported value leave the target in place.
+        elif amount > self.trigger_peak and (new_trigger or amount - self.trigger_peak >= .02 or amount == 1.):
+            self.trigger_peak = amount
+            travel = (amount - self.trigger_threshold) / (1. - self.trigger_threshold)
+            signed_angle = (1 - 2 * self.trigger_side) * (1. + travel) * math.pi / 2
+            self.start_turn(signed_angle)
 
 
 class LiveMDP(MDP):
@@ -119,8 +237,13 @@ class LiveTracker:
         return ReferencePlanner(self.playback, offsets=self.task.cfg.offsets)
 
     def command(self, state, fields):
-        window = tuple(torch.as_tensor(x, device=self.env.device, dtype=torch.float32)[None]
-                       for x in fields.components())
+        components = fields.components()
+        if self.task.cfg.body_reference:
+            components = components[1:]
+        window = tuple(torch.as_tensor(x, device=self.env.device, dtype=torch.float32)[None] for x in components)
+        if self.task.cfg.body_reference:
+            # The simulator's reference buffer still uses the common root/body tuple.
+            window = (torch.zeros_like(window[1]), *window)
         anchor = None
         if self.task.cfg.root_reference == "local":
             current = window[0].new_tensor(fields.current_pose[:7])[None]
@@ -133,6 +256,8 @@ class LiveTracker:
             return pose
         pose = pose.copy()
         pose[:2] = state[0][0, :2].cpu().numpy()
+        if self.task.cfg.body_reference:
+            return pose
         current = quat_to_mat(state[0].new_tensor(fields.current_pose[3:7]))
         rotation = quat_to_mat(state[0].new_tensor(pose[3:7]))
         adjustment = yaw_mat(state[1][0]) @ yaw_mat(current).T
@@ -164,6 +289,9 @@ def load_tracker(checkpoint_path, lmm, device, ema, *, score=False, root_referen
     settings = checkpoint["args"]
     reference_data = dict(checkpoint["reference_cfg"])
     if root_reference != "auto":
+        saved_mode = reference_data.get("root_reference")
+        if (saved_mode == "body-heading") != (root_reference == "body-heading"):
+            raise ValueError("Body-heading playback requires a checkpoint trained with the same reference interface")
         reference_data["root_reference"] = root_reference
     elif "root_reference" not in reference_data:
         # Checkpoints exported by the original joint trainer used the world path.
@@ -182,7 +310,8 @@ def load_tracker(checkpoint_path, lmm, device, ema, *, score=False, root_referen
     mdp_cls = MDP if score else LiveMDP
     mdp = mdp_cls(kin, motion, torch.tensor(default_joint_pos_list(), device=device),
                   RewardCfg(w_self_collision=settings.get("self_collision_weight", 0.),
-                            local_reference_root=reference.root_reference == "local"),
+                            local_reference_root=reference.root_reference == "local",
+                            body_reference=reference.body_reference),
                   independent_surface_friction=ground is not None,
                   delay_steps=DELAY_STEPS if settings.get("s17_actuators") else 0)
     task = ReferenceTask(reference, mdp)
@@ -204,10 +333,12 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--gamepad", action="store_true", help="Read an SDL gamepad (default)")
     mode.add_argument("--scripted", action="store_true", help="Use the given velocity/switches for a repeatable test")
+    parser.add_argument("--gamepad-mode", choices=("omnidirectional", "direction-basis", "legacy"),
+                        default="omnidirectional")
     parser.add_argument("--gamepad-library")
     parser.add_argument("--gamepad-wait", type=float, default=10.)
     parser.add_argument("--walk-speed", type=float, default=.72)
-    parser.add_argument("--run-speed", type=float, default=1.55)
+    parser.add_argument("--run-speed", type=float, help="Full forward stick speed (omnidirectional: 2.2 m/s, other modes: 1.55 m/s)")
     parser.add_argument("--turn-speed", type=float, default=2.8)
     parser.add_argument("--deadzone", type=float, default=.20)
     parser.add_argument("--velocity", type=float, nargs=3, default=(0., 0., 0.))
@@ -217,8 +348,10 @@ def main():
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ema", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--root-reference", choices=("auto", "local", "world"), default="auto")
+    parser.add_argument("--root-reference", choices=("auto", "local", "world", "body-heading"), default="auto")
     args = parser.parse_args()
+    if args.run_speed is None:
+        args.run_speed = 2.2 if args.gamepad_mode == "omnidirectional" else 1.55
     limits = (args.seconds, args.walk_speed, args.run_speed, args.turn_speed, args.deadzone, args.gamepad_wait)
     if (not all(math.isfinite(x) for x in (*limits, *args.velocity)) or args.seconds < 0
             or not 0 < args.walk_speed <= args.run_speed or args.turn_speed <= 0
@@ -250,7 +383,15 @@ def play(args, schedule, limit):
                            root_reference=getattr(args, "root_reference", "auto"))
     print(f"Root reference mode: {tracker.task.cfg.root_reference}", flush=True)
     env, policy = tracker.env, tracker.policy
-    steer = GamepadSteering(args.walk_speed, args.run_speed, args.turn_speed, args.deadzone)
+    use_direction_basis = not args.scripted and args.gamepad_mode == "direction-basis"
+    use_omnidirectional = not args.scripted and args.gamepad_mode == "omnidirectional"
+    steering_type = OmnidirectionalSteering if use_omnidirectional else GamepadSteering
+    steer = steering_type(args.walk_speed, args.run_speed, args.turn_speed, args.deadzone)
+    controls = {
+        "omnidirectional": "Left: vx/vy  Right X: yaw rate\nD-pad / LT / RT: turn by angle",
+        "direction-basis": "Left: move  Right X: turn/set forward",
+        "legacy": "Left: move  Right: aim  LT: hold",
+    }[args.gamepad_mode]
 
     def reset():
         planner = tracker.reset()
@@ -263,7 +404,7 @@ def play(args, schedule, limit):
             print(f"Waiting for an SDL gamepad ({args.gamepad_wait:g} s)...", flush=True)
             pad = Gamepad(args.gamepad_library, wait=args.gamepad_wait)
             stack.callback(pad.close)
-            print(f"{pad.name}: left stick move, right stick aim, LT hold, A walk, Start reset", flush=True)
+            print(f"{pad.name}: {controls}, A walk, Start reset", flush=True)
         viewer = None
         if not args.headless:
             from ..reference_viewer import ReferenceViewer
@@ -289,7 +430,7 @@ def play(args, schedule, limit):
                 if viewer is not None:
                     with viewer.viewer.lock():
                         cam = viewer.viewer.cam
-                        if orbit:
+                        if orbit and args.gamepad_mode == "legacy":
                             right = np.asarray(axes[2:])
                             length = np.linalg.norm(right)
                             if length > args.deadzone:
@@ -298,13 +439,28 @@ def play(args, schedule, limit):
                                 cam.elevation = float(np.clip(cam.elevation + math.degrees(2 * CONTROL_DT) * up, -72., 0.))
                         cam.distance = float(np.clip(cam.distance + 10 * zoom * CONTROL_DT, .1, 100.))
                         camera_yaw = math.radians(cam.azimuth)
-                command = steer.update(axes, walk=walk, orbit=orbit, hold=pad.hold_heading_pressed(),
-                                       camera_yaw=camera_yaw)
+                if use_omnidirectional:
+                    robot_yaw = body_yaw(state)
+                    dpad, triggers = pad.turning_inputs()
+                    command = steer.update_omnidirectional(axes, walk=walk, robot_yaw=robot_yaw,
+                                                           dpad=dpad, triggers=triggers)
+                elif use_direction_basis:
+                    robot_yaw = body_yaw(state)
+                    command = steer.update_direction_basis(axes, walk=walk, robot_yaw=robot_yaw)
+                else:
+                    command = steer.update(axes, walk=walk, orbit=orbit, hold=pad.hold_heading_pressed(),
+                                           camera_yaw=camera_yaw)
             else:
                 command = schedule.get(frame, command)
             display_frame = episode_frame
             if not fallen:
-                fields = planner.plan(command)
+                reference_command = command
+                if use_omnidirectional:
+                    reference_command = steer.reference_command(command)
+                elif use_direction_basis and isinstance(command, HeadingCommand):
+                    _, error = command.resolve(robot_yaw)
+                    reference_command = replace(command, heading=tracker.playback.state.yaw + error)
+                fields = planner.plan(reference_command)
                 obs = env.observe()[:, None]
                 history = obs.expand(-1, policy.hist, -1) if history is None else torch.cat((history[:, 1:], obs), 1)
                 cmd, window = tracker.command(state, fields)
@@ -322,12 +478,15 @@ def play(args, schedule, limit):
                     status = "Fallen: press Start to reset"
                 elif isinstance(command, HeadingCommand):
                     display, error = command.resolve(body_yaw(state))
-                    status = f"Target speed {np.linalg.norm(display[:2]):.2f} m/s   Heading error {math.degrees(error):+.0f} deg"
+                    status = (f"vx {display[0]:+.2f}  vy {display[1]:+.2f} m/s"
+                              f"   Heading error {math.degrees(error):+.0f} deg")
                 else:
-                    status = f"vx {command[0]:+.2f} m/s   wz {command[2]:+.2f} rad/s"
+                    status = f"vx {command[0]:+.2f}  vy {command[1]:+.2f} m/s   wz {command[2]:+.2f} rad/s"
+                if use_direction_basis:
+                    status += f"   Forward basis {math.degrees(steer.direction_basis):+.0f} deg"
                 viewer.viewer.set_texts((None, None,
                     f"LMM + S17 controller | {tracker.task.cfg.root_reference} reference\n"
-                    "Left: move  Right: aim  LT: hold\nA: walk  Start: reset  Space: pause", status))
+                    f"{controls}\nA: walk  Start: reset  Space: pause", status))
                 if not viewer.show_reference(state, reference_pose, display_frame * CONTROL_DT):
                     break
             frame += 1

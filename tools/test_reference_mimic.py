@@ -17,10 +17,10 @@ from supermimic.acp.collect_mimic import (
 )
 from supermimic.acp.env import surface_friction_values, validate_surface_friction
 from supermimic.acp.footstep.motion_matching import Robot
-from supermimic.acp.footstep.play_lmm_tracker import GamepadSteering
+from supermimic.acp.footstep.play_lmm_tracker import GamepadSteering, OmnidirectionalSteering
 from supermimic.acp.footstep.lmm_contact import (FORMAT as FOOTHOLD_FORMAT, LOOKAHEAD, POSE_FEATURES, Preview,
                                               check_seed_codec, decode_events, label_rows, load_head, world_events)
-from supermimic.acp.footstep.learned_motion import LearnedPlayback
+from supermimic.acp.footstep.learned_motion import BoundedHeadingCommand, LearnedPlayback, PlaybackState
 from supermimic.acp.footstep.finetune_lmm_contacts import WorldPlan, expand_policy, extract_rows, measured_events
 from supermimic.acp.footstep.lmm_contact_scenarios import SCHEMA as SCENARIO_SCHEMA, read_scenarios
 from supermimic.acp.footstep.rollout_controller import digest
@@ -50,6 +50,7 @@ from supermimic.acp.robot import (
 )
 from supermimic.acp.rollout_contacts import RAW_COLUMNS, aggregate_contacts
 from supermimic.acp.task import ContactCfg, ContactTask
+from supermimic.rotations import mat_to_6d
 
 
 def test_reference_command_clamps_to_own_clip_and_contains_joint_targets():
@@ -118,6 +119,51 @@ def test_local_reference_reward_and_critic_ignore_planar_drift_but_keep_height()
                                mdp.critic_features(state, frames, xi, boxes), atol=1e-6, rtol=1e-5)
     higher = (p + torch.tensor([[0., 0., .10]]), *ref[1:])
     assert mdp.reward(higher, frames, qd, qd) < mdp.reward(ref, frames, qd, qd)
+
+
+def test_body_heading_command_and_reward_use_body_offsets_and_measured_heading():
+    kin = RobotKinematics("cpu")
+    q = torch.tensor(default_joint_pos_list())[None]
+    p = torch.tensor([[1., 2., .8]])
+    R = torch.eye(3)[None]
+    v = torch.tensor([[.4, .2, 0.]])
+    w = torch.zeros_like(v)
+    qd = torch.zeros_like(q)
+    state = p, R, v, w, q, qd
+    bp, bR, bv, bw = kin.forward(*state)
+    boxes = torch.zeros(1, 1, 9)
+    motion = SimpleNamespace(
+        root_p=p, root_R=R, root_v=v, root_w=w, q=q, qd=qd, body_p=bp, body_R=bR, body_v=bv, body_w=bw,
+        clip_id=torch.zeros(1, dtype=torch.long), clip_end=torch.zeros(1, dtype=torch.long),
+        boxes=lambda *_: boxes,
+    )
+    mdp = MDP(kin, motion, q[0], RewardCfg(body_reference=True))
+    task = ReferenceTask(ReferenceCfg((1,), root_reference="body-heading"), mdp)
+    index = torch.zeros(1, dtype=torch.long)
+    cmd = task.command(state, index, index)
+    online = (torch.full_like(p[:, None], torch.nan), *(field[:, None] for field in state[1:]))
+    torch.testing.assert_close(cmd, task.command_from_reference(state, online, boxes), atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(cmd[:, :6], mat_to_6d(R))
+    torch.testing.assert_close(cmd[:, 12:12+NUM_J], q)
+    torch.testing.assert_close(cmd[:, 12+2*NUM_J:task.frame_dim], (bp - p[:, None]).flatten(1))
+
+    xi = torch.zeros(1, XI_DIM)
+    reward = mdp.reward(state, index, qd, qd)
+    critic = mdp.critic_features(state, index, xi, boxes)
+    shift = torch.tensor([[10., -5., 3.]])
+    motion.root_p = p + shift
+    motion.body_p = bp + shift[:, None]
+    torch.testing.assert_close(cmd, task.command(state, index, index))
+    torch.testing.assert_close(reward, mdp.reward(state, index, qd, qd))
+    torch.testing.assert_close(critic, mdp.critic_features(state, index, xi, boxes), atol=1e-6, rtol=1e-5)
+    assert not mdp.termination(state, index).item()
+
+    turn = torch.tensor([[[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]])
+    turned = p, turn, (turn @ v[..., None]).squeeze(-1), w, q, qd
+    cmd_turned = task.command(turned, index, index)
+    torch.testing.assert_close(cmd_turned[:, :6], mat_to_6d(turn.transpose(-1, -2)))
+    torch.testing.assert_close(cmd_turned[:, 6:task.frame_dim], cmd[:, 6:task.frame_dim])
+    assert mdp.reward(turned, index, qd, qd) < reward
 
 
 def test_reference_skip_and_projection_match_physical_joint_coordinates():
@@ -270,6 +316,133 @@ def test_cpp_style_right_stick_aim_is_remembered_for_forward_drive():
     assert aimed.heading == .3 + np.pi / 2
     assert steering.update((1., 0., 0., 0.), **mode).heading == aimed.heading
     assert abs(steering.update((-1., 0., 0., 0.), **mode).heading) == np.pi
+
+
+def test_right_stick_release_redefines_forward_without_left_stick_rebasing():
+    steering = GamepadSteering(.72, 1.55, 2.8, .20)
+    north, east, west = 0., -np.pi / 2, np.pi / 2
+
+    def move(axes, yaw):
+        return steering.update_direction_basis(axes, walk=False, robot_yaw=yaw)
+
+    assert move((1., 0., 0., 0.), north).heading == north
+    reverse = move((-1., 0., 0., 0.), north)
+    assert reverse.drive == (1.55, 0.) and abs(reverse.heading) == np.pi
+    assert move((1., 0., 0., 0.), np.pi).heading == north
+    np.testing.assert_allclose(move((1., 0., -.5, 0.), north), [0., 0., -.7])
+    np.testing.assert_array_equal(move((0., 0., 0., 0.), east), [0., 0., 0.])
+    assert move((1., 0., 0., 0.), east).heading == east
+    assert move((-1., 0., 0., 0.), east).heading == west
+    assert move((1., 0., 0., 0.), west).heading == east
+    diagonal = move((.5, .5, 0., 0.), west)
+    np.testing.assert_allclose(diagonal.heading, east + np.pi / 4)
+    np.testing.assert_allclose(diagonal.drive, (.775, 0.))
+
+
+@pytest.mark.parametrize(("buttons", "degrees"), [
+    ((True, False, False), 90), ((False, True, False), -90), ((False, False, True), 180),
+    ((True, False, True), 135), ((False, True, True), -135),
+])
+def test_omnidirectional_dpad_selects_a_relative_turn(buttons, degrees):
+    steer = OmnidirectionalSteering(.72, 1.55, 2.8, .20)
+    yaw = 2.8
+    steer.reset(yaw)
+    command = steer.update_omnidirectional((-.6, .4, 0.), walk=False, robot_yaw=yaw,
+                                           dpad=buttons, triggers=(0., 0.))
+    velocity, error = command.resolve(yaw)
+    assert np.degrees(error) == pytest.approx(degrees)
+    assert velocity[0] < 0 < velocity[1]
+    yaw += np.sign(degrees) * .15
+    remaining = steer.update_omnidirectional((0., 0., 0.), walk=False, robot_yaw=yaw,
+                                             dpad=(False, False, False), triggers=(0., 0.))
+    assert remaining.resolve(yaw)[1] == pytest.approx(np.radians(degrees) - np.sign(degrees) * .15)
+
+
+def test_omnidirectional_dpad_combines_buttons_pressed_on_different_frames():
+    steer = OmnidirectionalSteering(.72, 1.55, 2.8, .20)
+    steer.update_omnidirectional((0., 0., 0.), walk=False, robot_yaw=0.,
+                                  dpad=(True, False, False), triggers=(0., 0.))
+    for buttons in ((True, False, True), (False, False, True)):
+        step = steer.update_omnidirectional((0., 0., 0.), walk=False, robot_yaw=.2,
+                                            dpad=buttons, triggers=(0., 0.))
+        assert step.heading == pytest.approx(3 * np.pi / 4)
+
+
+@pytest.mark.parametrize("side", [0, 1])
+def test_omnidirectional_triggers_hold_peak_angle_and_respect_turn_side(side):
+    steer = OmnidirectionalSteering(.72, 1.55, 2.8, .20)
+
+    def move(amount, axes=(0., 0., 0.), yaw=0.):
+        triggers = (amount, 0.) if side == 0 else (0., amount)
+        return steer.update_omnidirectional(axes, walk=False, robot_yaw=yaw, dpad=(False,) * 3, triggers=triggers)
+
+    sign = 1 - 2 * side
+    np.testing.assert_array_equal(move(.20), [0., 0., 0.])
+    assert np.degrees(move(.60).resolve(0.)[1]) == pytest.approx(sign * 135.)
+    assert np.degrees(move(1.).resolve(0.)[1]) == pytest.approx(sign * 180.)
+    assert np.degrees(move(.30).resolve(0.)[1]) == pytest.approx(sign * 180.)
+    assert np.degrees(move(0.).resolve(0.)[1]) == pytest.approx(sign * 180.)
+    command = move(0., axes=(1., 0., -.5))
+    np.testing.assert_allclose(command, [1.55, 0., -.7])
+    np.testing.assert_allclose(move(0., axes=(-1., 0., 0.)), [-1.55, 0., 0.])
+
+
+@pytest.mark.parametrize(("buttons", "triggers", "target"), [
+    ((True, False, False), (0., 0.), np.pi / 2),
+    ((False, False, False), (0., 1.), -np.pi),
+])
+def test_turn_finishes_once_even_if_input_stays_held(buttons, triggers, target):
+    steer = OmnidirectionalSteering(.72, 1.55, 2.8, .20)
+
+    def update(yaw, *, held=True):
+        return steer.update_omnidirectional((.6, 0., 0.), walk=False, robot_yaw=yaw,
+                                            dpad=buttons if held else (False,) * 3,
+                                            triggers=triggers if held else (0., 0.))
+
+    assert update(0.).resolve(0.)[1] == pytest.approx(target)
+    for fraction in (.6, 1.05, 1.08, .95):
+        yaw = np.arctan2(np.sin(fraction * target), np.cos(fraction * target))
+        command = update(yaw)
+        if fraction > .6:
+            np.testing.assert_allclose(command, [.558, 0., 0.])
+    update(yaw, held=False)
+    assert update(yaw).resolve(yaw)[1] == pytest.approx(target)
+
+
+def test_held_trigger_does_not_restart_a_stalled_turn():
+    steer = OmnidirectionalSteering(.72, 1.55, 2.8, .20)
+
+    def update(amount):
+        return steer.update_omnidirectional((0., 0., 0.), walk=False, robot_yaw=0.,
+                                            dpad=(False,) * 3, triggers=(amount, 0.))
+
+    assert update(.80).resolve(0.)[1] > 0.
+    for _ in range(300):
+        command = update(.80)
+    np.testing.assert_array_equal(command, [0., 0., 0.])
+    np.testing.assert_array_equal(update(.81), [0., 0., 0.])
+    assert update(.95).resolve(0.)[1] > 0.
+
+
+@pytest.mark.parametrize("sign", [-1., 1.])
+def test_lmm_finite_turn_bounds_query_and_decoded_heading(sign):
+    goal = sign * np.pi
+    command = BoundedHeadingCommand((1., 0.), goal, 2.8)
+    shift, facing = command.trajectory(sign * .1, np.zeros(2), sign * 2.8)
+    angle = np.arctan2(facing[:, 1], facing[:, 0])
+    np.testing.assert_allclose(angle, sign * .1)
+    np.testing.assert_allclose(shift[-1] - shift[0], (2/3) * facing[-1])
+    assert command.resolve(0.)[0][2] == pytest.approx(sign * 2.8)
+
+    playback = LearnedPlayback.__new__(LearnedPlayback)
+    playback.fps = 60
+    playback.stepper = lambda motion: motion
+    yaw = goal - sign * .01
+    state = PlaybackState(torch.zeros(1), np.zeros(2), yaw, command.resolve(yaw)[0], 3, target_heading=goal)
+    state = playback.step(state, command, (np.zeros(2), sign * 2.8))
+    assert state.yaw == pytest.approx(goal)
+    state = playback.step(state, command, (np.zeros(2), sign * 2.8))
+    assert state.yaw == pytest.approx(goal)
 
 
 def test_lmm_joint_exploration_only_reaches_committed_steps():
